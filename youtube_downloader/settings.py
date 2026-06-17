@@ -13,6 +13,7 @@ SETTINGS_PATH = APP_CONFIG_DIR / "settings.json"
 DEFAULT_SETTINGS: dict[str, Any] = {
     "last_output_dir": str(Path.home() / "Downloads"),
     "last_mode": "video",
+    "last_quality": "best",
 }
 
 

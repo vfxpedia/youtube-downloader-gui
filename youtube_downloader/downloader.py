@@ -38,6 +38,7 @@ class DownloadRequest:
     url: str
     output_dir: Path
     mode: str
+    quality: str = "best"
 
 
 class CancelToken:
@@ -107,6 +108,7 @@ def build_command(request: DownloadRequest) -> list[str]:
         "--progress",
         "--windows-filenames",
         "--ignore-errors",
+        "--yes-playlist",
         "-P",
         str(request.output_dir),
         "-o",
@@ -120,7 +122,7 @@ def build_command(request: DownloadRequest) -> list[str]:
     if request.mode == "audio":
         command.extend(["-x", "--audio-format", "mp3", "--audio-quality", "0"])
     elif request.mode == "video":
-        command.extend(["-f", "bv*+ba/best", "--merge-output-format", "mp4"])
+        command.extend(["-f", _video_format_selector(request.quality), "--merge-output-format", "mp4"])
     else:
         raise ValueError(f"Unsupported download mode: {request.mode}")
 
@@ -136,6 +138,21 @@ def _detect_js_runtime() -> str | None:
     if shutil.which("bun"):
         return "bun"
     return None
+
+
+def _video_format_selector(quality: str) -> str:
+    if quality == "best":
+        return "bv*+ba/best"
+
+    try:
+        max_height = int(quality)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported video quality: {quality}") from exc
+
+    if max_height <= 0:
+        raise ValueError(f"Unsupported video quality: {quality}")
+
+    return f"bv*[height<={max_height}]+ba/best[height<={max_height}]/best"
 
 
 def run_download(

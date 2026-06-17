@@ -39,6 +39,16 @@ MODE_LABELS = {
     "audio": "음원 MP3",
 }
 
+QUALITY_LABELS = {
+    "best": "최고화질",
+    "2160": "2160p 이하",
+    "1440": "1440p 이하",
+    "1080": "1080p 이하",
+    "720": "720p 이하",
+    "480": "480p 이하",
+    "360": "360p 이하",
+}
+
 
 class DownloadWorker(QObject):
     progress = Signal(float, str)
@@ -96,6 +106,13 @@ class MainWindow(QMainWindow):
             self.mode_combo.addItem(label, mode)
         selected_index = self.mode_combo.findData(self._settings.get("last_mode", "video"))
         self.mode_combo.setCurrentIndex(max(selected_index, 0))
+        self.mode_combo.currentIndexChanged.connect(self.update_quality_enabled)
+
+        self.quality_combo = QComboBox()
+        for quality, label in QUALITY_LABELS.items():
+            self.quality_combo.addItem(label, quality)
+        selected_quality = self.quality_combo.findData(self._settings.get("last_quality", "best"))
+        self.quality_combo.setCurrentIndex(max(selected_quality, 0))
 
         self.dependency_label = QLabel()
         self.refresh_button = QPushButton("상태 새로고침")
@@ -136,6 +153,8 @@ class MainWindow(QMainWindow):
         input_layout.addWidget(self.output_button, 1, 2)
         input_layout.addWidget(QLabel("형식"), 2, 0)
         input_layout.addWidget(self.mode_combo, 2, 1, 1, 2)
+        input_layout.addWidget(QLabel("화질"), 3, 0)
+        input_layout.addWidget(self.quality_combo, 3, 1, 1, 2)
 
         dependency_group = QGroupBox("실행 환경")
         dependency_layout = QHBoxLayout(dependency_group)
@@ -163,6 +182,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(log_group, 1)
 
         self.setCentralWidget(central)
+        self.update_quality_enabled()
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
@@ -225,10 +245,18 @@ class MainWindow(QMainWindow):
         )
 
     @Slot()
+    @Slot(int)
+    def update_quality_enabled(self, _index: int | None = None) -> None:
+        is_video = self.mode_combo.currentData() == "video"
+        self.quality_combo.setEnabled(is_video)
+        self.quality_combo.setToolTip("" if is_video else "음원 MP3는 최고 음질로 추출합니다.")
+
+    @Slot()
     def start_download(self) -> None:
         url = self.url_input.text().strip()
         output_text = self.output_input.text().strip()
         mode = str(self.mode_combo.currentData())
+        quality = str(self.quality_combo.currentData())
 
         if not url:
             QMessageBox.warning(self, "URL 필요", "다운로드할 YouTube URL을 입력하세요.")
@@ -256,14 +284,16 @@ class MainWindow(QMainWindow):
             )
             return
 
-        save_settings({"last_output_dir": str(output_dir), "last_mode": mode})
+        save_settings({"last_output_dir": str(output_dir), "last_mode": mode, "last_quality": quality})
         self.progress_bar.setValue(0)
         self.status_label.setText("다운로드 준비 중")
         self.log_view.clear()
         self._append_log(f"URL: {url}")
         self._append_log(f"형식: {MODE_LABELS.get(mode, mode)}")
+        if mode == "video":
+            self._append_log(f"화질: {QUALITY_LABELS.get(quality, quality)}")
 
-        request = DownloadRequest(url=url, output_dir=output_dir, mode=mode)
+        request = DownloadRequest(url=url, output_dir=output_dir, mode=mode, quality=quality)
         self._thread = QThread(self)
         self._worker = DownloadWorker(request)
         self._worker.moveToThread(self._thread)
@@ -334,6 +364,7 @@ class MainWindow(QMainWindow):
         self.output_input.setEnabled(not running)
         self.output_button.setEnabled(not running)
         self.mode_combo.setEnabled(not running)
+        self.quality_combo.setEnabled(not running and self.mode_combo.currentData() == "video")
         self.refresh_button.setEnabled(not running)
         self.download_button.setEnabled(not running)
         self.cancel_button.setEnabled(running)
