@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -86,6 +87,7 @@ def check_dependencies() -> DependencyStatus:
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=_subprocess_env(),
         )
         yt_dlp_version = result.stdout.strip() or "installed"
     except (OSError, subprocess.CalledProcessError):
@@ -177,6 +179,7 @@ def run_download(
         errors="replace",
         bufsize=1,
         creationflags=creation_flags,
+        env=_subprocess_env(),
     )
     cancel_token.attach_process(process)
 
@@ -240,3 +243,11 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=5)
+
+
+def _subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
