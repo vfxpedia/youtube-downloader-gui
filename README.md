@@ -71,7 +71,19 @@ Linux에서는 배포판 패키지 관리자를 사용하세요.
 sudo apt install ffmpeg
 ```
 
-앱은 Node.js, Deno, Bun 중 설치된 JavaScript 런타임을 감지해 `yt-dlp --js-runtimes ... --remote-components ejs:github` 옵션을 자동으로 사용합니다.
+앱은 실행할 때 `yt-dlp`를 최신 버전으로 업데이트합니다. 또한 Node.js, Deno, Bun 중 설치된 JavaScript 런타임을 감지해 `yt-dlp --js-runtimes ... --remote-components ejs:github` 옵션을 자동으로 사용합니다.
+
+## 다운로드 실패 확인
+
+`yt-dlp가 오류 코드 1로 종료되었습니다.`는 yt-dlp가 다운로드를 실패했다는 공통 종료 코드입니다. 앱은 실패 시 원인으로 보이는 `ERROR`, `WARNING`, 최근 로그를 팝업과 로그 창에 함께 표시합니다.
+
+자주 발생하는 원인:
+
+- 재생목록 안에 비공개, 삭제, 지역 제한, 연령 제한 영상이 포함된 경우
+- 선택한 화질이나 포맷을 해당 영상이 제공하지 않는 경우
+- YouTube 추출 방식이 바뀌어 yt-dlp 업데이트가 필요한 경우
+- ffmpeg 병합 또는 MP3 변환 중 오류가 난 경우
+- 저장 폴더 권한, 긴 경로, 디스크 용량 문제가 있는 경우
 
 ## 파일명과 중복 처리
 

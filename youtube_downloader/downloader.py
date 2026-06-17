@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,8 @@ PERCENT_PATTERN = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 ETA_PATTERN = re.compile(r"\bETA\s+([^\s]+)")
 SPEED_PATTERN = re.compile(r"\bat\s+([^\s]+\s*/s)")
 PLAYLIST_ITEM_PATTERN = re.compile(r"\[download\]\s+Downloading item\s+(\d+)\s+of\s+(\d+)")
+FAILURE_CONTEXT_LIMIT = 25
+ERROR_CONTEXT_LIMIT = 12
 
 
 @dataclass(frozen=True)
@@ -318,6 +321,7 @@ def run_download(
 
     on_log("yt-dlp 실행을 시작합니다.")
     on_log(f"저장 위치: {request.output_dir}")
+    on_log(f"실행 명령: {_format_command(command)}")
 
     creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
     process = subprocess.Popen(
@@ -332,6 +336,8 @@ def run_download(
         env=_subprocess_env(),
     )
     cancel_token.attach_process(process)
+    recent_lines: list[str] = []
+    error_lines: list[str] = []
 
     try:
         assert process.stdout is not None
@@ -345,6 +351,9 @@ def run_download(
                 continue
 
             on_log(line)
+            _append_limited(recent_lines, line, FAILURE_CONTEXT_LIMIT)
+            if _is_error_context_line(line):
+                _append_limited(error_lines, line, ERROR_CONTEXT_LIMIT)
             item_progress = _parse_playlist_item(line)
             if item_progress is not None and on_playlist_item is not None:
                 on_playlist_item(*item_progress)
@@ -362,7 +371,7 @@ def run_download(
         raise DownloadCancelled("다운로드가 취소되었습니다.")
 
     if return_code != 0:
-        raise DownloadError(f"yt-dlp가 오류 코드 {return_code}로 종료되었습니다.")
+        raise DownloadError(_format_download_error(return_code, error_lines, recent_lines))
 
     on_progress(100.0, "완료")
     on_log("다운로드가 완료되었습니다.")
@@ -394,6 +403,51 @@ def _summarize_progress(line: str) -> str:
     if eta:
         parts.append(f"ETA {eta.group(1)}")
     return " / ".join(parts) if parts else "다운로드 중"
+
+
+def _append_limited(lines: list[str], line: str, limit: int) -> None:
+    lines.append(line)
+    if len(lines) > limit:
+        del lines[0]
+
+
+def _is_error_context_line(line: str) -> bool:
+    lowered = line.lower()
+    markers = (
+        "error:",
+        "warning:",
+        "unable to",
+        "failed",
+        "not available",
+        "unavailable",
+        "private video",
+        "sign in",
+        "requested format",
+        "http error",
+        "forbidden",
+        "permission denied",
+        "no space left",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _format_download_error(return_code: int, error_lines: list[str], recent_lines: list[str]) -> str:
+    lines = [f"yt-dlp가 오류 코드 {return_code}로 종료되었습니다."]
+    context = error_lines or recent_lines[-8:]
+    if context:
+        lines.append("")
+        lines.append("원인으로 보이는 로그:")
+        lines.extend(f"- {line}" for line in context[-8:])
+    else:
+        lines.append("")
+        lines.append("원인 로그를 찾지 못했습니다. 로그 창의 마지막 줄을 확인해 주세요.")
+    return "\n".join(lines)
+
+
+def _format_command(command: list[str]) -> str:
+    if sys.platform.startswith("win"):
+        return subprocess.list2cmdline(command)
+    return shlex.join(command)
 
 
 def _terminate_process(process: subprocess.Popen[str]) -> None:

@@ -735,7 +735,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText("오류")
         self._append_log(f"오류: {message}")
         self._set_running(False)
-        self._notify("다운로드 실패", message)
+        self._notify("다운로드 실패", "자세한 원인은 앱 로그와 실패 팝업을 확인하세요.")
         QMessageBox.critical(self, "다운로드 실패", message)
 
     @Slot()
