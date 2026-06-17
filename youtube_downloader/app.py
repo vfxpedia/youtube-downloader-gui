@@ -537,6 +537,10 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def preview_loaded(self, info: MediaInfo) -> None:
         self._preview_info = info
+        original_url = self.url_input.text().strip()
+        if original_url and original_url != info.url:
+            self.url_input.setText(info.url)
+            self._append_log(f"URL 자동 보정: {info.url}")
         signals_blocked = self.folder_name_input.blockSignals(True)
         self.folder_name_input.setText(info.title)
         self.folder_name_input.blockSignals(signals_blocked)

@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -190,6 +191,19 @@ def preview_filename(title: str, index: int, request: DownloadRequest) -> str:
 
 
 def fetch_media_info(url: str) -> MediaInfo:
+    errors: list[str] = []
+    for candidate_url in _metadata_candidate_urls(url):
+        result = _run_media_info_command(candidate_url)
+        if result.returncode == 0:
+            return _parse_media_info(candidate_url, result.stdout)
+
+        message = result.stderr.strip() or result.stdout.strip() or "URL 정보를 가져오지 못했습니다."
+        errors.append(f"{candidate_url}\n{message}")
+
+    raise DownloadError(_format_metadata_error(errors))
+
+
+def _run_media_info_command(url: str) -> subprocess.CompletedProcess[str]:
     command = [
         sys.executable,
         "-m",
@@ -206,7 +220,7 @@ def fetch_media_info(url: str) -> MediaInfo:
         command.extend(["--remote-components", "ejs:github"])
     command.append(url)
 
-    result = subprocess.run(
+    return subprocess.run(
         command,
         check=False,
         capture_output=True,
@@ -215,14 +229,16 @@ def fetch_media_info(url: str) -> MediaInfo:
         errors="replace",
         env=_subprocess_env(),
     )
-    if result.returncode != 0:
-        message = result.stderr.strip() or result.stdout.strip() or "URL 정보를 가져오지 못했습니다."
-        raise DownloadError(message)
 
+
+def _parse_media_info(url: str, output: str) -> MediaInfo:
     try:
-        payload = json.loads(result.stdout)
+        payload = json.loads(output)
     except json.JSONDecodeError as exc:
         raise DownloadError("yt-dlp 정보 조회 결과를 해석하지 못했습니다.") from exc
+
+    if not isinstance(payload, dict):
+        raise DownloadError("yt-dlp 정보 조회 결과가 비어 있습니다. URL을 다시 확인해 주세요.")
 
     title = str(payload.get("title") or payload.get("fulltitle") or "제목 없음")
     raw_entries = payload.get("entries")
@@ -251,6 +267,49 @@ def fetch_media_info(url: str) -> MediaInfo:
         )
 
     return MediaInfo(title=title, url=url, entries=entries)
+
+
+def _metadata_candidate_urls(url: str) -> list[str]:
+    candidates = [url]
+    normalized = _normalized_youtube_playlist_url(url)
+    if normalized is not None and normalized not in candidates:
+        candidates.append(normalized)
+    return candidates
+
+
+def _normalized_youtube_playlist_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    if parsed.netloc.lower() not in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
+        return None
+
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    playlist_id = query.get("list")
+    if not playlist_id or playlist_id.endswith("_"):
+        return None
+
+    # Some copied YouTube playlist URLs silently drop a trailing underscore.
+    # The API then returns HTTP 400 even though the playlist exists.
+    query["list"] = f"{playlist_id}_"
+    return urlunparse(
+        (
+            parsed.scheme or "https",
+            "www.youtube.com",
+            parsed.path or "/playlist",
+            parsed.params,
+            urlencode(query),
+            parsed.fragment,
+        )
+    )
+
+
+def _format_metadata_error(errors: list[str]) -> str:
+    if not errors:
+        return "URL 정보를 가져오지 못했습니다."
+    if len(errors) == 1:
+        return errors[0]
+    return "URL 분석에 실패했습니다. 아래 후보 URL을 순서대로 시도했습니다.\n\n" + "\n\n".join(
+        f"[시도 {index}]\n{message}" for index, message in enumerate(errors, start=1)
+    )
 
 
 def _detect_js_runtime() -> str | None:
