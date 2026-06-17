@@ -15,6 +15,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "last_mode": "video",
     "last_quality": "best",
     "last_filename_mode": "title",
+    "last_folder_mode": "playlist",
     "last_duplicate_mode": "skip",
 }
 

@@ -44,6 +44,7 @@ class DownloadRequest:
     mode: str
     quality: str = "best"
     filename_mode: str = "title"
+    folder_mode: str = "playlist"
     duplicate_mode: str = "skip"
     collection_title: str = ""
     name_token: str = ""
@@ -173,13 +174,16 @@ def preview_filename(title: str, index: int, request: DownloadRequest) -> str:
     safe_title = _safe_filename(title)
     token = f"_{request.name_token}" if request.duplicate_mode == "unique" and request.name_token else ""
     if request.filename_mode == "title":
-        return f"{safe_title}{token}.{ext}"
-    if request.filename_mode == "numbered":
-        return f"{index:03d}_{safe_title}{token}.{ext}"
-    if request.filename_mode == "playlist_folder":
-        folder = _safe_filename(request.collection_title or "playlist")
-        return f"{folder}/{index:03d}_{safe_title}{token}.{ext}"
-    raise ValueError(f"Unsupported filename mode: {request.filename_mode}")
+        filename = f"{safe_title}{token}.{ext}"
+    elif request.filename_mode in {"numbered", "playlist_folder"}:
+        filename = f"{index:03d}_{safe_title}{token}.{ext}"
+    else:
+        raise ValueError(f"Unsupported filename mode: {request.filename_mode}")
+
+    folder = _folder_prefix(request)
+    if folder:
+        return f"{folder}/{filename}"
+    return filename
 
 
 def fetch_media_info(url: str) -> MediaInfo:
@@ -259,13 +263,26 @@ def _detect_js_runtime() -> str | None:
 def _output_template(request: DownloadRequest) -> str:
     token = f"_{request.name_token}" if request.duplicate_mode == "unique" and request.name_token else ""
     if request.filename_mode == "title":
-        return f"%(title)s{token}.%(ext)s"
-    if request.filename_mode == "numbered":
-        return f"%(autonumber)03d_%(title)s{token}.%(ext)s"
+        filename = f"%(title)s{token}.%(ext)s"
+    elif request.filename_mode in {"numbered", "playlist_folder"}:
+        filename = f"%(autonumber)03d_%(title)s{token}.%(ext)s"
+    else:
+        raise ValueError(f"Unsupported filename mode: {request.filename_mode}")
+
+    folder = _folder_prefix(request)
+    if folder:
+        return f"{folder}/{filename}"
+    return filename
+
+
+def _folder_prefix(request: DownloadRequest) -> str:
     if request.filename_mode == "playlist_folder":
-        folder = _safe_filename(request.collection_title or "playlist")
-        return f"{folder}/%(autonumber)03d_%(title)s{token}.%(ext)s"
-    raise ValueError(f"Unsupported filename mode: {request.filename_mode}")
+        return _safe_filename(request.collection_title or "playlist")
+    if request.folder_mode == "root":
+        return ""
+    if request.folder_mode == "playlist":
+        return _safe_filename(request.collection_title or "playlist")
+    raise ValueError(f"Unsupported folder mode: {request.folder_mode}")
 
 
 def _safe_filename(value: str) -> str:
