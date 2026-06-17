@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import shutil
 import subprocess
@@ -12,11 +13,13 @@ from typing import Callable
 
 
 ProgressCallback = Callable[[float | None, str], None]
+PlaylistItemCallback = Callable[[int, int], None]
 LogCallback = Callable[[str], None]
 
 PERCENT_PATTERN = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 ETA_PATTERN = re.compile(r"\bETA\s+([^\s]+)")
 SPEED_PATTERN = re.compile(r"\bat\s+([^\s]+\s*/s)")
+PLAYLIST_ITEM_PATTERN = re.compile(r"\[download\]\s+Downloading item\s+(\d+)\s+of\s+(\d+)")
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,24 @@ class DownloadRequest:
     output_dir: Path
     mode: str
     quality: str = "best"
+
+
+@dataclass(frozen=True)
+class MediaEntry:
+    title: str
+    url: str
+    duration: int | None = None
+
+
+@dataclass(frozen=True)
+class MediaInfo:
+    title: str
+    url: str
+    entries: list[MediaEntry]
+
+    @property
+    def item_count(self) -> int:
+        return max(1, len(self.entries))
 
 
 class CancelToken:
@@ -132,6 +153,70 @@ def build_command(request: DownloadRequest) -> list[str]:
     return command
 
 
+def fetch_media_info(url: str) -> MediaInfo:
+    command = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--dump-single-json",
+        "--flat-playlist",
+        "--skip-download",
+        "--yes-playlist",
+        "--no-warnings",
+    ]
+    js_runtime = _detect_js_runtime()
+    if js_runtime is not None:
+        command.extend(["--js-runtimes", js_runtime])
+        command.extend(["--remote-components", "ejs:github"])
+    command.append(url)
+
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=_subprocess_env(),
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "URL 정보를 가져오지 못했습니다."
+        raise DownloadError(message)
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise DownloadError("yt-dlp 정보 조회 결과를 해석하지 못했습니다.") from exc
+
+    title = str(payload.get("title") or payload.get("fulltitle") or "제목 없음")
+    raw_entries = payload.get("entries")
+    entries: list[MediaEntry] = []
+    if isinstance(raw_entries, list) and raw_entries:
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, dict):
+                continue
+            entry_title = str(raw_entry.get("title") or raw_entry.get("id") or "제목 없음")
+            entry_url = str(raw_entry.get("url") or raw_entry.get("webpage_url") or "")
+            duration = raw_entry.get("duration")
+            entries.append(
+                MediaEntry(
+                    title=entry_title,
+                    url=entry_url,
+                    duration=duration if isinstance(duration, int) else None,
+                )
+            )
+    else:
+        entries.append(
+            MediaEntry(
+                title=title,
+                url=str(payload.get("webpage_url") or url),
+                duration=payload.get("duration") if isinstance(payload.get("duration"), int) else None,
+            )
+        )
+
+    return MediaInfo(title=title, url=url, entries=entries)
+
+
 def _detect_js_runtime() -> str | None:
     if shutil.which("deno"):
         return "deno"
@@ -162,6 +247,7 @@ def run_download(
     cancel_token: CancelToken,
     on_progress: ProgressCallback,
     on_log: LogCallback,
+    on_playlist_item: PlaylistItemCallback | None = None,
 ) -> None:
     request.output_dir.mkdir(parents=True, exist_ok=True)
     command = build_command(request)
@@ -195,6 +281,9 @@ def run_download(
                 continue
 
             on_log(line)
+            item_progress = _parse_playlist_item(line)
+            if item_progress is not None and on_playlist_item is not None:
+                on_playlist_item(*item_progress)
             percent = _parse_percent(line)
             if percent is not None:
                 on_progress(percent, _summarize_progress(line))
@@ -223,6 +312,13 @@ def _parse_percent(line: str) -> float | None:
         return float(match.group(1))
     except ValueError:
         return None
+
+
+def _parse_playlist_item(line: str) -> tuple[int, int] | None:
+    match = PLAYLIST_ITEM_PATTERN.search(line)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 def _summarize_progress(line: str) -> str:
