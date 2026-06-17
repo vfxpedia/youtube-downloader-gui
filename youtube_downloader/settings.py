@@ -12,12 +12,14 @@ SETTINGS_PATH = APP_CONFIG_DIR / "settings.json"
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "last_output_dir": str(Path.home() / "Downloads"),
+    "last_url": "",
     "last_mode": "video",
     "last_quality": "best",
     "last_filename_mode": "title",
     "last_folder_mode": "playlist",
     "last_duplicate_mode": "skip",
     "last_subtitle_mode": "none",
+    "open_folder_on_finish": False,
     "window_geometry": "",
     "window_state": "",
     "splitter_state": "",

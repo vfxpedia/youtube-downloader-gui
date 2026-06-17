@@ -15,6 +15,7 @@ from PySide6.QtGui import QColor, QCloseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QGridLayout,
@@ -225,7 +226,7 @@ class MainWindow(QMainWindow):
         self._pause_requested = False
         self._session_log_path: Path | None = None
 
-        self.url_input = QLineEdit()
+        self.url_input = QLineEdit(str(self._settings.get("last_url", "")))
         self.url_input.setPlaceholderText("YouTube 영상 또는 재생목록 URL")
 
         self.output_input = QLineEdit(str(self._settings["last_output_dir"]))
@@ -279,6 +280,9 @@ class MainWindow(QMainWindow):
             self.subtitle_combo.addItem(label, mode)
         selected_subtitle_mode = self.subtitle_combo.findData(self._settings.get("last_subtitle_mode", "none"))
         self.subtitle_combo.setCurrentIndex(max(selected_subtitle_mode, 0))
+
+        self.open_folder_on_finish_checkbox = QCheckBox("완료 후 저장 폴더 열기")
+        self.open_folder_on_finish_checkbox.setChecked(bool(self._settings.get("open_folder_on_finish", False)))
 
         self.preview_button = QPushButton("1. 목록 불러오기")
         self.preview_button.clicked.connect(self.load_preview)
@@ -409,6 +413,7 @@ class MainWindow(QMainWindow):
         input_layout.addWidget(self.duplicate_mode_combo, 5, 1, 1, 3)
         input_layout.addWidget(QLabel("자막"), 6, 0)
         input_layout.addWidget(self.subtitle_combo, 6, 1, 1, 3)
+        input_layout.addWidget(self.open_folder_on_finish_checkbox, 7, 1, 1, 3)
 
         action_layout = QHBoxLayout()
         action_layout.addWidget(self.preview_button)
@@ -709,12 +714,14 @@ class MainWindow(QMainWindow):
         save_settings(
             {
                 "last_output_dir": output_text,
+                "last_url": self._preview_info.url,
                 "last_mode": request.mode,
                 "last_quality": request.quality,
                 "last_filename_mode": request.filename_mode,
                 "last_folder_mode": request.folder_mode,
                 "last_duplicate_mode": request.duplicate_mode,
                 "last_subtitle_mode": request.subtitle_mode,
+                "open_folder_on_finish": self.open_folder_on_finish_checkbox.isChecked(),
             }
         )
         self._append_queue_row(job)
@@ -898,6 +905,8 @@ class MainWindow(QMainWindow):
             self._continue_after_cleanup = True
         else:
             self._notify("다운로드 완료", "모든 대기열 다운로드가 완료되었습니다.")
+            if self.open_folder_on_finish_checkbox.isChecked():
+                self.open_output_folder()
 
     @Slot()
     def download_cancelled(self) -> None:
