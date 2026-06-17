@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QByteArray, QObject, QThread, Signal, Slot
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -308,6 +308,7 @@ class MainWindow(QMainWindow):
 
         self._build_layout()
         self._apply_style()
+        self._restore_ui_state()
         self.refresh_dependencies()
         self.update_quality_enabled()
         self.update_folder_controls()
@@ -331,7 +332,7 @@ class MainWindow(QMainWindow):
         root_layout = QVBoxLayout(central)
         root_layout.setContentsMargins(16, 16, 16, 16)
 
-        splitter = QSplitter()
+        self.main_splitter = QSplitter()
         left = QWidget()
         left_layout = QVBoxLayout(left)
         right = QWidget()
@@ -403,10 +404,10 @@ class MainWindow(QMainWindow):
         result_layout.addWidget(self.result_summary_label)
         result_layout.addWidget(self.result_table)
 
-        right_tabs = QTabWidget()
-        right_tabs.addTab(preview_group, "받을 목록")
-        right_tabs.addTab(queue_group, "대기열")
-        right_tabs.addTab(result_group, "결과 검증")
+        self.right_tabs = QTabWidget()
+        self.right_tabs.addTab(preview_group, "받을 목록")
+        self.right_tabs.addTab(queue_group, "대기열")
+        self.right_tabs.addTab(result_group, "결과 검증")
 
         left_layout.addWidget(input_group)
         left_layout.addLayout(action_layout)
@@ -414,12 +415,12 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(dependency_group)
         left_layout.addWidget(log_group, 1)
 
-        right_layout.addWidget(right_tabs, 1)
+        right_layout.addWidget(self.right_tabs, 1)
 
-        splitter.addWidget(left)
-        splitter.addWidget(right)
-        splitter.setSizes([640, 500])
-        root_layout.addWidget(splitter)
+        self.main_splitter.addWidget(left)
+        self.main_splitter.addWidget(right)
+        self.main_splitter.setSizes([640, 500])
+        root_layout.addWidget(self.main_splitter)
         self.setCentralWidget(central)
 
     def _apply_style(self) -> None:
@@ -455,6 +456,45 @@ class MainWindow(QMainWindow):
                 background: #eeeeee;
             }
             """
+        )
+
+    def _restore_ui_state(self) -> None:
+        self._restore_byte_array(self.restoreGeometry, "window_geometry")
+        self._restore_byte_array(self.restoreState, "window_state")
+        self._restore_byte_array(self.main_splitter.restoreState, "splitter_state")
+        self._restore_header_state(self.preview_table, "preview_header_state")
+        self._restore_header_state(self.queue_table, "queue_header_state")
+        self._restore_header_state(self.result_table, "result_header_state")
+        tab_index = self._settings.get("right_tab_index", 0)
+        if isinstance(tab_index, int) and 0 <= tab_index < self.right_tabs.count():
+            self.right_tabs.setCurrentIndex(tab_index)
+
+    def _restore_byte_array(self, restore: object, key: str) -> None:
+        encoded = self._settings.get(key, "")
+        if not isinstance(encoded, str) or not encoded:
+            return
+        try:
+            restore(QByteArray.fromBase64(encoded.encode("ascii")))  # type: ignore[misc]
+        except (TypeError, ValueError):
+            return
+
+    def _restore_header_state(self, table: QTableWidget, key: str) -> None:
+        encoded = self._settings.get(key, "")
+        if not isinstance(encoded, str) or not encoded:
+            return
+        table.horizontalHeader().restoreState(QByteArray.fromBase64(encoded.encode("ascii")))
+
+    def _save_ui_state(self) -> None:
+        save_settings(
+            {
+                "window_geometry": _encode_qbytearray(self.saveGeometry()),
+                "window_state": _encode_qbytearray(self.saveState()),
+                "splitter_state": _encode_qbytearray(self.main_splitter.saveState()),
+                "right_tab_index": self.right_tabs.currentIndex(),
+                "preview_header_state": _encode_qbytearray(self.preview_table.horizontalHeader().saveState()),
+                "queue_header_state": _encode_qbytearray(self.queue_table.horizontalHeader().saveState()),
+                "result_header_state": _encode_qbytearray(self.result_table.horizontalHeader().saveState()),
+            }
         )
 
     @Slot()
@@ -934,7 +974,12 @@ class MainWindow(QMainWindow):
             if self._download_thread is not None:
                 self._download_thread.quit()
                 self._download_thread.wait(3000)
+        self._save_ui_state()
         event.accept()
+
+
+def _encode_qbytearray(value: QByteArray) -> str:
+    return bytes(value.toBase64()).decode("ascii")
 
 
 def _format_duration(duration: int | None) -> str:

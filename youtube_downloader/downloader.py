@@ -254,7 +254,7 @@ def _parse_media_info(url: str, output: str) -> MediaInfo:
                 MediaEntry(
                     title=entry_title,
                     url=entry_url,
-                    duration=duration if isinstance(duration, int) else None,
+                    duration=_duration_seconds(duration),
                 )
             )
     else:
@@ -262,11 +262,19 @@ def _parse_media_info(url: str, output: str) -> MediaInfo:
             MediaEntry(
                 title=title,
                 url=str(payload.get("webpage_url") or url),
-                duration=payload.get("duration") if isinstance(payload.get("duration"), int) else None,
+                duration=_duration_seconds(payload.get("duration")),
             )
         )
 
     return MediaInfo(title=title, url=url, entries=entries)
+
+
+def _duration_seconds(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and value >= 0:
+        return int(round(value))
+    return None
 
 
 def _metadata_candidate_urls(url: str) -> list[str]:

@@ -17,6 +17,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "last_filename_mode": "title",
     "last_folder_mode": "playlist",
     "last_duplicate_mode": "skip",
+    "window_geometry": "",
+    "window_state": "",
+    "splitter_state": "",
+    "right_tab_index": 0,
+    "preview_header_state": "",
+    "queue_header_state": "",
+    "result_header_state": "",
 }
 
 
@@ -40,7 +47,7 @@ def load_settings() -> dict[str, Any]:
 
 def save_settings(settings: dict[str, Any]) -> None:
     APP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    data = DEFAULT_SETTINGS.copy()
+    data = load_settings()
     data.update({key: value for key, value in settings.items() if key in data})
 
     with SETTINGS_PATH.open("w", encoding="utf-8") as file:
