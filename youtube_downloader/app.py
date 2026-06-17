@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+import re
+import unicodedata
+from dataclasses import dataclass, replace
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QObject, QThread, Signal, Slot
@@ -96,7 +99,11 @@ class AuditResult:
     index: int
     title: str
     expected_path: Path
-    note: str
+    actual_path: Path | None
+    reason: str
+    action: str
+    request: DownloadRequest
+    entry: MediaEntry
 
 
 class MetadataWorker(QObject):
@@ -195,6 +202,7 @@ class MainWindow(QMainWindow):
         self._download_worker: DownloadWorker | None = None
         self._continue_after_cleanup = False
         self._active_jobs: list[QueueJob] = []
+        self._last_audit_results: list[AuditResult] = []
         self._session_log_path: Path | None = None
 
         self.url_input = QLineEdit()
@@ -264,6 +272,9 @@ class MainWindow(QMainWindow):
         self.move_down_button.clicked.connect(self.move_queue_item_down)
         self.remove_queue_button = QPushButton("삭제")
         self.remove_queue_button.clicked.connect(self.remove_queue_item)
+        self.retry_problem_button = QPushButton("문제 항목만 다시 받기")
+        self.retry_problem_button.setEnabled(False)
+        self.retry_problem_button.clicked.connect(self.retry_problem_items)
 
         self.dependency_label = QLabel()
         self.refresh_button = QPushButton("상태 새로고침")
@@ -291,9 +302,9 @@ class MainWindow(QMainWindow):
         self.result_summary_label = QLabel("다운로드 후 결과 검증이 여기에 표시됩니다.")
         self.result_summary_label.setWordWrap(True)
         self.result_table = QTableWidget(0, 6)
-        self.result_table.setHorizontalHeaderLabels(["상태", "작업", "#", "제목", "예상 파일", "메모"])
+        self.result_table.setHorizontalHeaderLabels(["번호", "제목", "상태", "실제 파일", "문제 원인", "조치"])
         self._setup_table(self.result_table)
-        self._set_column_widths(self.result_table, [82, 220, 54, 300, 480, 220])
+        self._set_column_widths(self.result_table, [64, 320, 96, 520, 300, 220])
         self.result_table.setSortingEnabled(True)
 
         self.log_view = QTextEdit()
@@ -403,6 +414,10 @@ class MainWindow(QMainWindow):
         result_layout = QVBoxLayout(result_group)
         result_layout.addWidget(self.result_summary_label)
         result_layout.addWidget(self.result_table)
+        result_action_layout = QHBoxLayout()
+        result_action_layout.addWidget(self.retry_problem_button)
+        result_action_layout.addStretch(1)
+        result_layout.addLayout(result_action_layout)
 
         self.right_tabs = QTabWidget()
         self.right_tabs.addTab(preview_group, "받을 목록")
@@ -763,6 +778,8 @@ class MainWindow(QMainWindow):
         self.result_table.setSortingEnabled(False)
         self.result_table.setRowCount(0)
         self.result_table.setSortingEnabled(True)
+        self.retry_problem_button.setEnabled(False)
+        self._last_audit_results = []
         self.result_summary_label.setText("다운로드가 끝나면 예상 파일과 실제 파일을 자동 검증합니다.")
         self.overall_progress_bar.setValue(0)
         self.current_progress_bar.setValue(0)
@@ -861,56 +878,131 @@ class MainWindow(QMainWindow):
         results: list[AuditResult] = []
         for job in jobs:
             for index, entry in enumerate(job.entries, start=1):
-                expected_path = self._expected_file_path(job.request, entry, index)
-                if expected_path.exists() and expected_path.stat().st_size > 0:
-                    status = "정상"
-                    note = f"{expected_path.stat().st_size / 1024 / 1024:.1f} MB"
-                elif expected_path.exists():
-                    status = "크기 이상"
-                    note = "0바이트 파일입니다."
-                elif alternative_path := self._find_alternative_file(expected_path):
-                    status = "파일명 차이"
-                    note = f"비슷한 파일 발견: {alternative_path.name}"
-                else:
-                    status = "누락"
-                    note = "예상 파일을 찾지 못했습니다."
-                results.append(
-                    AuditResult(
-                        status=status,
-                        job_title=job.title,
-                        index=index,
-                        title=entry.title,
-                        expected_path=expected_path,
-                        note=note,
-                    )
-                )
+                results.append(self._audit_entry(job, entry, index))
         return results
+
+    def _audit_entry(self, job: QueueJob, entry: MediaEntry, index: int) -> AuditResult:
+        expected_path = self._expected_file_path(job.request, entry, index)
+        final_ext = ".mp3" if job.request.mode == "audio" else ".mp4"
+
+        if expected_path.exists():
+            if _file_size(expected_path) > 0:
+                return self._audit_result("정상", job, entry, index, expected_path, expected_path, "예상 파일명과 일치", "")
+            return self._audit_result("확인 필요", job, entry, index, expected_path, expected_path, "0바이트 최종 파일", "파일 삭제 후 다시 받기")
+
+        folder = expected_path.parent
+        files = _safe_list_files(folder)
+        final_candidates = [path for path in files if path.suffix.lower() == final_ext and _file_size(path) > 0]
+        final_match = self._best_file_match(final_candidates, expected_path, entry, index, job.request)
+        if final_match is not None:
+            reason = "실제 저장 파일명 기준으로 확인"
+            if _normalized_stem(final_match) != _normalized_stem(expected_path):
+                reason = f"예상 파일명과 다르지만 같은 항목으로 판단: {final_match.name}"
+            return self._audit_result("정상", job, entry, index, expected_path, final_match, reason, "")
+
+        partial_candidates = [path for path in files if _is_intermediate_file(path)]
+        partial_match = self._best_file_match(partial_candidates, expected_path, entry, index, job.request)
+        if partial_match is not None:
+            return self._audit_result(
+                "미완료",
+                job,
+                entry,
+                index,
+                expected_path,
+                partial_match,
+                f"최종 파일 없이 중간 파일만 남음: {partial_match.name}",
+                "문제 항목만 다시 받기",
+            )
+
+        weak_match = self._weak_final_candidate(final_candidates, expected_path, entry, index, job.request)
+        if weak_match is not None:
+            return self._audit_result(
+                "확인 필요",
+                job,
+                entry,
+                index,
+                expected_path,
+                weak_match,
+                f"비슷한 최종 파일 발견: {weak_match.name}",
+                "파일 확인 후 필요하면 다시 받기",
+            )
+
+        return self._audit_result("누락", job, entry, index, expected_path, None, "최종 파일과 중간 파일을 찾지 못함", "문제 항목만 다시 받기")
+
+    def _audit_result(
+        self,
+        status: str,
+        job: QueueJob,
+        entry: MediaEntry,
+        index: int,
+        expected_path: Path,
+        actual_path: Path | None,
+        reason: str,
+        action: str,
+    ) -> AuditResult:
+        return AuditResult(
+            status=status,
+            job_title=job.title,
+            index=index,
+            title=entry.title,
+            expected_path=expected_path,
+            actual_path=actual_path,
+            reason=reason,
+            action=action,
+            request=job.request,
+            entry=entry,
+        )
 
     def _expected_file_path(self, request: DownloadRequest, entry: MediaEntry, index: int) -> Path:
         relative = preview_filename(entry.title, index, request)
         return request.output_dir.joinpath(*relative.split("/"))
 
-    def _find_alternative_file(self, expected_path: Path) -> Path | None:
-        if not expected_path.parent.exists():
+    def _best_file_match(
+        self,
+        candidates: list[Path],
+        expected_path: Path,
+        entry: MediaEntry,
+        index: int,
+        request: DownloadRequest,
+    ) -> Path | None:
+        scored = [
+            (score, path)
+            for path in candidates
+            if (score := _file_match_score(path, expected_path, entry, index, request)) >= 80
+        ]
+        if not scored:
             return None
-        candidates = sorted(
-            (path for path in expected_path.parent.iterdir() if path.is_file() and path.stem == expected_path.stem),
-            key=lambda path: path.stat().st_size if path.exists() else 0,
-            reverse=True,
-        )
-        for candidate in candidates:
-            if candidate.is_file() and candidate.stat().st_size > 0:
-                return candidate
-        return None
+        scored.sort(key=lambda item: (item[0], _file_size(item[1])), reverse=True)
+        return scored[0][1]
+
+    def _weak_final_candidate(
+        self,
+        candidates: list[Path],
+        expected_path: Path,
+        entry: MediaEntry,
+        index: int,
+        request: DownloadRequest,
+    ) -> Path | None:
+        scored = [
+            (score, path)
+            for path in candidates
+            if (score := _file_match_score(path, expected_path, entry, index, request)) >= 55
+        ]
+        if not scored:
+            return None
+        scored.sort(key=lambda item: (item[0], _file_size(item[1])), reverse=True)
+        return scored[0][1]
 
     def _display_audit_results(self, label: str, results: list[AuditResult]) -> None:
+        self._last_audit_results = results
         ok_count = sum(1 for result in results if result.status == "정상")
+        incomplete_count = sum(1 for result in results if result.status == "미완료")
+        review_count = sum(1 for result in results if result.status == "확인 필요")
         missing_count = sum(1 for result in results if result.status == "누락")
-        suspicious_count = sum(1 for result in results if result.status == "크기 이상")
-        renamed_count = sum(1 for result in results if result.status == "파일명 차이")
         self.result_summary_label.setText(
-            f"{label}: 총 {len(results)}개 중 정상 {ok_count}개, 파일명 차이 {renamed_count}개, 누락 {missing_count}개, 크기 이상 {suspicious_count}개"
+            f"{label}: 총 {len(results)}개 중 정상 {ok_count}개, 미완료 {incomplete_count}개, 확인 필요 {review_count}개, 누락 {missing_count}개"
         )
+        self.retry_problem_button.setEnabled(any(result.status in {"미완료", "누락", "확인 필요"} for result in results))
 
         self.result_table.setSortingEnabled(False)
         self.result_table.setRowCount(0)
@@ -918,12 +1010,12 @@ class MainWindow(QMainWindow):
             row = self.result_table.rowCount()
             self.result_table.insertRow(row)
             values = [
-                result.status,
-                result.job_title,
                 str(result.index),
                 result.title,
-                str(result.expected_path),
-                result.note,
+                result.status,
+                str(result.actual_path or result.expected_path),
+                result.reason,
+                result.action,
             ]
             for column, value in enumerate(values):
                 self.result_table.setItem(row, column, QTableWidgetItem(value))
@@ -933,7 +1025,46 @@ class MainWindow(QMainWindow):
         self._append_log(f"결과 검증: {self.result_summary_label.text()}")
         for result in results:
             if result.status != "정상":
-                self._append_log(f"[{label}] {result.status}: {result.index}. {result.title} -> {result.expected_path}")
+                actual = f" / 실제: {result.actual_path}" if result.actual_path is not None else ""
+                self._append_log(f"[{label}] {result.status}: {result.index}. {result.title} -> 예상: {result.expected_path}{actual} / {result.reason}")
+
+    @Slot()
+    def retry_problem_items(self) -> None:
+        if self._download_worker is not None:
+            QMessageBox.information(self, "다운로드 중", "진행 중인 작업이 끝난 뒤 문제 항목을 다시 추가하세요.")
+            return
+
+        retry_results = [result for result in self._last_audit_results if result.status in {"미완료", "누락", "확인 필요"}]
+        if not retry_results:
+            QMessageBox.information(self, "재시도 항목 없음", "다시 받을 문제 항목이 없습니다.")
+            return
+
+        added = 0
+        for result in retry_results:
+            if not result.entry.url:
+                self._append_log(f"재시도 제외: {result.index}. {result.title} - 개별 영상 URL 없음")
+                continue
+            retry_request = replace(
+                result.request,
+                url=result.entry.url,
+                index_override=result.index if result.request.filename_mode in {"numbered", "playlist_folder"} else None,
+            )
+            retry_job = QueueJob(
+                title=f"재시도: {result.title}",
+                item_count=1,
+                request=retry_request,
+                entries=[result.entry],
+            )
+            self._queue.append(retry_job)
+            self._append_queue_row(retry_job)
+            added += 1
+
+        if added:
+            self.right_tabs.setCurrentIndex(1)
+            self._append_log(f"문제 항목 재시도 대기열 추가: {added}개")
+            QMessageBox.information(self, "대기열 추가 완료", f"문제 항목 {added}개를 대기열에 추가했습니다.")
+        else:
+            QMessageBox.warning(self, "재시도 실패", "개별 영상 URL이 없어 대기열에 추가하지 못했습니다.")
 
     @Slot(str)
     def _append_log(self, message: str) -> None:
@@ -955,6 +1086,9 @@ class MainWindow(QMainWindow):
         self.move_up_button.setEnabled(not running)
         self.move_down_button.setEnabled(not running)
         self.remove_queue_button.setEnabled(not running)
+        self.retry_problem_button.setEnabled(
+            not running and any(result.status in {"미완료", "누락", "확인 필요"} for result in self._last_audit_results)
+        )
 
     def _notify(self, title: str, message: str) -> None:
         if self.tray_icon.isVisible():
@@ -990,6 +1124,100 @@ def _format_duration(duration: int | None) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{seconds:02d}"
     return f"{minutes}:{seconds:02d}"
+
+
+def _safe_list_files(folder: Path) -> list[Path]:
+    if not folder.exists() or not folder.is_dir():
+        return []
+    try:
+        return [path for path in folder.iterdir() if path.is_file()]
+    except OSError:
+        return []
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _is_intermediate_file(path: Path) -> bool:
+    lowered = path.name.lower()
+    if lowered.endswith(".part"):
+        return True
+    if re.search(r"\.f\d+\.", lowered):
+        return True
+    return path.suffix.lower() in {".webm", ".m4a", ".m4v"}
+
+
+def _file_match_score(path: Path, expected_path: Path, entry: MediaEntry, index: int, request: DownloadRequest) -> int:
+    candidate_stem = _normalized_stem(path)
+    expected_stem = _normalized_stem(expected_path)
+    if candidate_stem == expected_stem:
+        return 120
+
+    if entry.video_id and entry.video_id.lower() in path.name.lower():
+        return 115
+
+    numbered_prefix = f"{index:03d}_"
+    if request.filename_mode in {"numbered", "playlist_folder"} and path.name.startswith(numbered_prefix):
+        return 100
+
+    candidate_signature = _title_signature(path.stem)
+    entry_signature = _title_signature(entry.title)
+    expected_signature = _title_signature(expected_path.stem)
+    signatures = {signature for signature in (entry_signature, expected_signature) if signature}
+    if candidate_signature and candidate_signature in signatures:
+        return 95
+
+    entry_key = _match_key(entry.title)
+    candidate_key = _match_key(path.stem)
+    expected_key = _match_key(expected_path.stem)
+    if entry_key and (entry_key in candidate_key or candidate_key in entry_key):
+        return 92
+    if expected_key and (expected_key in candidate_key or candidate_key in expected_key):
+        return 90
+
+    ratio = max(
+        SequenceMatcher(None, entry_key, candidate_key).ratio() if entry_key and candidate_key else 0.0,
+        SequenceMatcher(None, expected_key, candidate_key).ratio() if expected_key and candidate_key else 0.0,
+    )
+    if ratio >= 0.72:
+        return 88
+    if ratio >= 0.55:
+        return 60
+    return 0
+
+
+def _normalized_stem(path: Path) -> str:
+    return _match_key(path.stem)
+
+
+def _match_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFC", value).lower()
+    normalized = re.sub(r"\.\w+$", "", normalized)
+    normalized = re.sub(r"\.\.\.|…", "", normalized)
+    normalized = re.sub(r"[<>:\"/\\|?*\[\](){}'`~!@#$%^&+=,.;：｜|_-]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def _title_signature(value: str) -> str:
+    normalized = unicodedata.normalize("NFC", value).lower()
+    bracketed = re.search(r"\[[^\]]+\]\s*\d+(?:-\d+)*", normalized)
+    if bracketed:
+        return _match_key(bracketed.group(0))
+
+    lesson = re.search(r"\b\d+(?:-\d+){1,3}\b", normalized)
+    if lesson:
+        prefix = normalized[max(0, lesson.start() - 20) : lesson.end()]
+        return _match_key(prefix)
+
+    leading = re.search(r"^\s*(\d{1,4})[_\-. ]+", normalized)
+    if leading:
+        return leading.group(1).lstrip("0") or "0"
+    return ""
 
 
 def main() -> int:

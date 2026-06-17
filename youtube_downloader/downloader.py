@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from dataclasses import dataclass
@@ -52,6 +53,7 @@ class DownloadRequest:
     duplicate_mode: str = "skip"
     collection_title: str = ""
     name_token: str = ""
+    index_override: int | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,7 @@ class MediaEntry:
     title: str
     url: str
     duration: int | None = None
+    video_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -131,6 +134,7 @@ def check_dependencies() -> DependencyStatus:
 
 
 def build_command(request: DownloadRequest) -> list[str]:
+    temp_dir = _download_temp_dir()
     command = [
         sys.executable,
         "-m",
@@ -141,8 +145,14 @@ def build_command(request: DownloadRequest) -> list[str]:
         "--windows-filenames",
         "--ignore-errors",
         "--yes-playlist",
+        "--file-access-retries",
+        "15",
+        "--retry-sleep",
+        "file_access:2",
         "-P",
-        str(request.output_dir),
+        f"home:{request.output_dir}",
+        "-P",
+        f"temp:{temp_dir}",
         "-o",
         _output_template(request),
     ]
@@ -177,10 +187,11 @@ def preview_filename(title: str, index: int, request: DownloadRequest) -> str:
     ext = "mp3" if request.mode == "audio" else "mp4"
     safe_title = _safe_filename(title)
     token = f"_{request.name_token}" if request.duplicate_mode == "unique" and request.name_token else ""
+    display_index = request.index_override if request.index_override is not None else index
     if request.filename_mode == "title":
         filename = f"{safe_title}{token}.{ext}"
     elif request.filename_mode in {"numbered", "playlist_folder"}:
-        filename = f"{index:03d}_{safe_title}{token}.{ext}"
+        filename = f"{display_index:03d}_{safe_title}{token}.{ext}"
     else:
         raise ValueError(f"Unsupported filename mode: {request.filename_mode}")
 
@@ -248,13 +259,15 @@ def _parse_media_info(url: str, output: str) -> MediaInfo:
             if not isinstance(raw_entry, dict):
                 continue
             entry_title = str(raw_entry.get("title") or raw_entry.get("id") or "제목 없음")
-            entry_url = str(raw_entry.get("url") or raw_entry.get("webpage_url") or "")
+            entry_id = str(raw_entry.get("id") or "")
+            entry_url = _entry_url(raw_entry, entry_id)
             duration = raw_entry.get("duration")
             entries.append(
                 MediaEntry(
                     title=entry_title,
                     url=entry_url,
                     duration=_duration_seconds(duration),
+                    video_id=entry_id,
                 )
             )
     else:
@@ -263,6 +276,7 @@ def _parse_media_info(url: str, output: str) -> MediaInfo:
                 title=title,
                 url=str(payload.get("webpage_url") or url),
                 duration=_duration_seconds(payload.get("duration")),
+                video_id=str(payload.get("id") or ""),
             )
         )
 
@@ -275,6 +289,22 @@ def _duration_seconds(value: object) -> int | None:
     if isinstance(value, (int, float)) and value >= 0:
         return int(round(value))
     return None
+
+
+def _entry_url(raw_entry: dict[str, object], entry_id: str) -> str:
+    webpage_url = raw_entry.get("webpage_url")
+    if isinstance(webpage_url, str) and webpage_url:
+        return webpage_url
+
+    raw_url = raw_entry.get("url")
+    if isinstance(raw_url, str) and raw_url:
+        if raw_url.startswith(("http://", "https://")):
+            return raw_url
+        return f"https://www.youtube.com/watch?v={raw_url}"
+
+    if entry_id:
+        return f"https://www.youtube.com/watch?v={entry_id}"
+    return ""
 
 
 def _metadata_candidate_urls(url: str) -> list[str]:
@@ -335,7 +365,10 @@ def _output_template(request: DownloadRequest) -> str:
     if request.filename_mode == "title":
         filename = f"%(title)s{token}.%(ext)s"
     elif request.filename_mode in {"numbered", "playlist_folder"}:
-        filename = f"%(autonumber)03d_%(title)s{token}.%(ext)s"
+        if request.index_override is not None:
+            filename = f"{request.index_override:03d}_%(title)s{token}.%(ext)s"
+        else:
+            filename = f"%(autonumber)03d_%(title)s{token}.%(ext)s"
     else:
         raise ValueError(f"Unsupported filename mode: {request.filename_mode}")
 
@@ -384,10 +417,12 @@ def run_download(
     on_playlist_item: PlaylistItemCallback | None = None,
 ) -> None:
     request.output_dir.mkdir(parents=True, exist_ok=True)
+    _download_temp_dir().mkdir(parents=True, exist_ok=True)
     command = build_command(request)
 
     on_log("yt-dlp 실행을 시작합니다.")
     on_log(f"저장 위치: {request.output_dir}")
+    on_log(f"임시 파일 위치: {_download_temp_dir()}")
     on_log(f"실행 명령: {_format_command(command)}")
 
     creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
@@ -501,14 +536,36 @@ def _is_error_context_line(line: str) -> bool:
 def _format_download_error(return_code: int, error_lines: list[str], recent_lines: list[str]) -> str:
     lines = [f"yt-dlp가 오류 코드 {return_code}로 종료되었습니다."]
     context = error_lines or recent_lines[-8:]
+    if _has_file_lock_error(context):
+        lines.extend(
+            [
+                "",
+                "분류: 파일 잠금으로 최종 저장에 실패했습니다.",
+                "다운로드 조각 파일은 받았지만 Windows에서 다른 프로세스가 파일을 잡고 있어 최종 파일명으로 바꾸지 못했습니다.",
+                "가능한 원인: 파일 탐색기 미리보기, 백신/보안 프로그램, 검색 인덱서, 동기화 프로그램, 미디어 플레이어.",
+                "앱은 다음 실행부터 임시 폴더를 분리하고 파일 접근 재시도를 늘려 같은 문제를 줄입니다.",
+            ]
+        )
     if context:
         lines.append("")
         lines.append("원인으로 보이는 로그:")
-        lines.extend(f"- {line}" for line in context[-8:])
+        lines.extend(f"- {line}" for line in context[-8:] if _should_show_failure_context(line))
     else:
         lines.append("")
         lines.append("원인 로그를 찾지 못했습니다. 로그 창의 마지막 줄을 확인해 주세요.")
     return "\n".join(lines)
+
+
+def _has_file_lock_error(lines: list[str]) -> bool:
+    text = "\n".join(lines).lower()
+    return "winerror 32" in text or "file is being used by another process" in text or "다른 프로세스가 파일을 사용 중" in text
+
+
+def _should_show_failure_context(line: str) -> bool:
+    lowered = line.lower()
+    if "redownloading playlist api json with unavailable videos" in lowered:
+        return False
+    return True
 
 
 def _format_command(command: list[str]) -> str:
@@ -532,3 +589,10 @@ def _subprocess_env() -> dict[str, str]:
     env["PYTHONUTF8"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
     return env
+
+
+def _download_temp_dir() -> Path:
+    root = os.getenv("LOCALAPPDATA")
+    if root:
+        return Path(root) / "YoutubeDownloaderGui" / "temp"
+    return Path(tempfile.gettempdir()) / "YoutubeDownloaderGui" / "temp"
