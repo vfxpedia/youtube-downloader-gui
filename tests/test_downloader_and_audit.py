@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 import youtube_downloader.app as app_module
-from youtube_downloader.app import MainWindow, QueueJob
+from youtube_downloader.app import MainWindow, MediaProbe, QueueJob
 from youtube_downloader.downloader import DownloadRequest, MediaEntry, build_command
 
 
@@ -59,6 +59,18 @@ class DownloaderCommandTests(unittest.TestCase):
 
         self.assertIn("--playlist-items", command)
         self.assertIn("1,23,31", command)
+
+    def test_video_selector_prefers_h264_before_fallbacks(self) -> None:
+        request = DownloadRequest(
+            url="https://www.youtube.com/watch?v=abc123",
+            output_dir=Path("C:/Downloads"),
+            mode="video",
+        )
+
+        command = build_command(request)
+        selector = command[command.index("-f") + 1]
+
+        self.assertLess(selector.index("vcodec^=avc1"), selector.index("bv*+ba"))
 
 
 class AuditTests(unittest.TestCase):
@@ -110,7 +122,8 @@ class AuditTests(unittest.TestCase):
 
             window = MainWindow()
             try:
-                results = window._build_audit_results([job])
+                with patch.object(app_module, "_media_probe", return_value=MediaProbe(duration=600.0, video_codec="h264", audio_codec="aac", checked=True)):
+                    results = window._build_audit_results([job])
             finally:
                 window.close()
 
@@ -143,7 +156,13 @@ class AuditTests(unittest.TestCase):
 
             window = MainWindow()
             try:
-                results = window._build_audit_results([job])
+                def probe(path: Path) -> MediaProbe:
+                    if path.name == "done.mp4":
+                        return MediaProbe(duration=10.0, video_codec="h264", audio_codec="aac", checked=True)
+                    return MediaProbe()
+
+                with patch.object(app_module, "_media_probe", side_effect=probe):
+                    results = window._build_audit_results([job])
                 window._display_audit_results("테스트", results)
                 problem_index = window.result_filter_combo.findData("problem")
                 window.result_filter_combo.setCurrentIndex(problem_index)
@@ -175,13 +194,74 @@ class AuditTests(unittest.TestCase):
 
             window = MainWindow()
             try:
-                with patch.object(app_module, "_media_duration_seconds", return_value=120.0):
+                with patch.object(app_module, "_media_probe", return_value=MediaProbe(duration=120.0, video_codec="h264", audio_codec="aac", checked=True)):
                     results = window._build_audit_results([job])
             finally:
                 window.close()
 
             self.assertEqual(results[0].status, "확인 필요")
             self.assertIn("길이 차이", results[0].reason)
+
+    def test_audit_flags_av1_video_for_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            playlist = root / "playlist"
+            playlist.mkdir()
+            (playlist / "lesson.mp4").write_bytes(b"ok")
+            request = DownloadRequest(
+                url="https://www.youtube.com/playlist?list=PL_TEST",
+                output_dir=root,
+                mode="video",
+                folder_mode="playlist",
+                collection_title="playlist",
+            )
+            job = QueueJob(
+                title="playlist",
+                item_count=1,
+                request=request,
+                entries=[MediaEntry(title="lesson", url="https://www.youtube.com/watch?v=one", duration=600)],
+            )
+
+            window = MainWindow()
+            try:
+                with patch.object(app_module, "_media_probe", return_value=MediaProbe(duration=600.0, video_codec="av1", audio_codec="opus", checked=True)):
+                    results = window._build_audit_results([job])
+            finally:
+                window.close()
+
+            self.assertEqual(results[0].status, "확인 필요")
+            self.assertIn("AV1", results[0].reason)
+            self.assertIn("H.264", results[0].action)
+
+    def test_audit_flags_video_file_without_video_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            playlist = root / "playlist"
+            playlist.mkdir()
+            (playlist / "lesson.mp4").write_bytes(b"ok")
+            request = DownloadRequest(
+                url="https://www.youtube.com/playlist?list=PL_TEST",
+                output_dir=root,
+                mode="video",
+                folder_mode="playlist",
+                collection_title="playlist",
+            )
+            job = QueueJob(
+                title="playlist",
+                item_count=1,
+                request=request,
+                entries=[MediaEntry(title="lesson", url="https://www.youtube.com/watch?v=one", duration=600)],
+            )
+
+            window = MainWindow()
+            try:
+                with patch.object(app_module, "_media_probe", return_value=MediaProbe(duration=600.0, audio_codec="aac", checked=True)):
+                    results = window._build_audit_results([job])
+            finally:
+                window.close()
+
+            self.assertEqual(results[0].status, "확인 필요")
+            self.assertIn("비디오 스트림 없음", results[0].reason)
 
     def test_audit_does_not_match_neighbor_lesson_number_as_normal(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -218,6 +298,36 @@ class AuditTests(unittest.TestCase):
 
             self.assertEqual(results[0].status, "미완료")
             self.assertIn("4-2", str(results[0].actual_path))
+
+    def test_file_match_accepts_letter_lesson_signature_with_translated_title(self) -> None:
+        request = DownloadRequest(
+            url="https://www.youtube.com/playlist?list=PL_TEST",
+            output_dir=Path("C:/Downloads"),
+            mode="video",
+        )
+        entry = MediaEntry(
+            title="[ROS2] P-2. Drawing Trigonometric Functions",
+            url="https://www.youtube.com/watch?v=lesson",
+        )
+        expected_path = Path("[ROS2] P-2. Drawing Trigonometric Functions.mp4")
+
+        score = app_module._file_match_score(
+            Path("[ROS2] P-2. Korean saved title.mp4"),
+            expected_path,
+            entry,
+            28,
+            request,
+        )
+        neighbor_score = app_module._file_match_score(
+            Path("[ROS2] P-3. Korean saved title.mp4"),
+            expected_path,
+            entry,
+            28,
+            request,
+        )
+
+        self.assertGreaterEqual(score, 80)
+        self.assertEqual(neighbor_score, 0)
 
     def test_preview_exclusion_queues_only_visible_playlist_items(self) -> None:
         window = MainWindow()

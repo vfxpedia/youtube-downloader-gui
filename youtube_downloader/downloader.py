@@ -412,7 +412,12 @@ def _safe_filename(value: str) -> str:
 
 def _video_format_selector(quality: str) -> str:
     if quality == "best":
-        return "bv*+ba/best"
+        return (
+            "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/"
+            "bv*[vcodec^=avc1]+ba/"
+            "b[ext=mp4][vcodec^=avc1]/"
+            "bv*+ba/best"
+        )
 
     try:
         max_height = int(quality)
@@ -422,7 +427,13 @@ def _video_format_selector(quality: str) -> str:
     if max_height <= 0:
         raise ValueError(f"Unsupported video quality: {quality}")
 
-    return f"bv*[height<={max_height}]+ba/best[height<={max_height}]/best"
+    return (
+        f"bv*[vcodec^=avc1][height<={max_height}]+ba[acodec^=mp4a]/"
+        f"bv*[vcodec^=avc1][height<={max_height}]+ba/"
+        f"b[ext=mp4][vcodec^=avc1][height<={max_height}]/"
+        f"bv*[height<={max_height}]+ba/"
+        f"best[height<={max_height}]/best"
+    )
 
 
 def run_download(

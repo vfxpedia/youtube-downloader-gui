@@ -132,6 +132,14 @@ class DurationCheck:
     note: str = ""
 
 
+@dataclass(frozen=True)
+class MediaProbe:
+    duration: float | None = None
+    video_codec: str | None = None
+    audio_codec: str | None = None
+    checked: bool = False
+
+
 class MetadataWorker(QObject):
     info_loaded = Signal(object)
     failed = Signal(str)
@@ -1119,7 +1127,33 @@ class MainWindow(QMainWindow):
         actual_path: Path,
         base_reason: str,
     ) -> AuditResult:
-        duration_check = _duration_check_note(actual_path, entry.duration)
+        probe = _media_probe(actual_path)
+        if job.request.mode == "video":
+            codec_check = _video_codec_check(probe)
+            if codec_check.status == "missing":
+                return self._audit_result(
+                    "확인 필요",
+                    job,
+                    entry,
+                    index,
+                    expected_path,
+                    actual_path,
+                    f"{base_reason} / {codec_check.note}",
+                    "비디오 포함 형식으로 다시 받기",
+                )
+            if codec_check.status == "incompatible":
+                return self._audit_result(
+                    "확인 필요",
+                    job,
+                    entry,
+                    index,
+                    expected_path,
+                    actual_path,
+                    f"{base_reason} / {codec_check.note}",
+                    "H.264로 다시 받기",
+                )
+
+        duration_check = _duration_check_note(probe, entry.duration)
         if duration_check.status == "mismatch":
             return self._audit_result(
                 "확인 필요",
@@ -1285,6 +1319,7 @@ class MainWindow(QMainWindow):
             retry_request = replace(
                 result.request,
                 url=result.entry.url,
+                duplicate_mode="overwrite",
                 index_override=result.index if result.request.filename_mode in {"numbered", "playlist_folder"} else None,
             )
             retry_job = QueueJob(
@@ -1438,11 +1473,21 @@ def _job_entry_index(job: QueueJob, offset: int) -> int:
     return offset
 
 
-def _duration_check_note(path: Path, expected_duration: int | None) -> DurationCheck:
+def _video_codec_check(probe: MediaProbe) -> DurationCheck:
+    if not probe.checked:
+        return DurationCheck("unknown", "비디오 코덱 확인 불가")
+    if probe.video_codec is None:
+        return DurationCheck("missing", "비디오 스트림 없음")
+    if probe.video_codec.lower() == "av1":
+        return DurationCheck("incompatible", "AV1 비디오 코덱이라 일부 플레이어에서 소리만 나올 수 있음")
+    return DurationCheck("ok", f"비디오 코덱: {probe.video_codec}")
+
+
+def _duration_check_note(probe: MediaProbe, expected_duration: int | None) -> DurationCheck:
     if expected_duration is None or expected_duration <= 0:
         return DurationCheck("unknown", "목록 길이 정보 없음")
 
-    actual_duration = _media_duration_seconds(path)
+    actual_duration = probe.duration
     if actual_duration is None:
         return DurationCheck("unknown", "파일 길이 확인 불가")
 
@@ -1456,10 +1501,10 @@ def _duration_check_note(path: Path, expected_duration: int | None) -> DurationC
     return DurationCheck("ok", f"길이 확인: {_format_duration(int(round(actual_duration)))}")
 
 
-def _media_duration_seconds(path: Path) -> float | None:
+def _media_probe(path: Path) -> MediaProbe:
     ffprobe = _ffprobe_path()
     if ffprobe is None:
-        return None
+        return MediaProbe()
     try:
         result = subprocess.run(
             [
@@ -1467,9 +1512,9 @@ def _media_duration_seconds(path: Path) -> float | None:
                 "-v",
                 "error",
                 "-show_entries",
-                "format=duration",
+                "format=duration:stream=codec_type,codec_name",
                 "-of",
-                "default=noprint_wrappers=1:nokey=1",
+                "json",
                 str(path),
             ],
             check=False,
@@ -1480,14 +1525,43 @@ def _media_duration_seconds(path: Path) -> float | None:
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return None
+        return MediaProbe()
 
     if result.returncode != 0:
-        return None
+        return MediaProbe()
+
     try:
-        return float(result.stdout.strip())
-    except ValueError:
-        return None
+        import json
+
+        payload = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        return MediaProbe()
+
+    duration = None
+    raw_duration = payload.get("format", {}).get("duration") if isinstance(payload, dict) else None
+    try:
+        duration = float(raw_duration)
+    except (TypeError, ValueError):
+        duration = None
+
+    video_codec = None
+    audio_codec = None
+    streams = payload.get("streams") if isinstance(payload, dict) else None
+    if isinstance(streams, list):
+        for stream in streams:
+            if not isinstance(stream, dict):
+                continue
+            codec_type = stream.get("codec_type")
+            codec_name = stream.get("codec_name")
+            if codec_type == "video" and video_codec is None and isinstance(codec_name, str):
+                video_codec = codec_name
+            if codec_type == "audio" and audio_codec is None and isinstance(codec_name, str):
+                audio_codec = codec_name
+    return MediaProbe(duration=duration, video_codec=video_codec, audio_codec=audio_codec, checked=True)
+
+
+def _media_duration_seconds(path: Path) -> float | None:
+    return _media_probe(path).duration
 
 
 def _ffprobe_path() -> str | None:
@@ -1556,9 +1630,14 @@ def _match_key(value: str) -> str:
 
 def _title_signature(value: str) -> str:
     normalized = unicodedata.normalize("NFC", value).lower()
-    bracketed = re.search(r"\[[^\]]+\]\s*\d+(?:-\d+)*", normalized)
+    bracketed = re.search(r"\[[^\]]+\]\s*(?:[a-z]+-)?\d+(?:-\d+)*", normalized)
     if bracketed:
         return _match_key(bracketed.group(0))
+
+    letter_lesson = re.search(r"\b[a-z]+-\d+(?:-\d+)*\b", normalized)
+    if letter_lesson:
+        prefix = normalized[max(0, letter_lesson.start() - 20) : letter_lesson.end()]
+        return _match_key(prefix)
 
     lesson = re.search(r"\b\d+(?:-\d+){1,3}\b", normalized)
     if lesson:
