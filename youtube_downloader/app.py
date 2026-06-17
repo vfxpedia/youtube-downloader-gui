@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import re
+import shutil
 import unicodedata
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -10,7 +11,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 import subprocess
 
-from PySide6.QtCore import QByteArray, QObject, QThread, Signal, Slot
+from PySide6.QtCore import QByteArray, QObject, QThread, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QCloseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -125,6 +126,12 @@ class AuditResult:
     entry: MediaEntry
 
 
+@dataclass(frozen=True)
+class DurationCheck:
+    status: str
+    note: str = ""
+
+
 class MetadataWorker(QObject):
     info_loaded = Signal(object)
     failed = Signal(str)
@@ -166,8 +173,15 @@ class DownloadWorker(QObject):
 
                 def item_callback(index: int, reported_total: int) -> None:
                     nonlocal current_item, item_total
-                    current_item = max(1, index)
-                    item_total = max(item_total, reported_total)
+                    if job.request.playlist_items:
+                        try:
+                            current_item = job.request.playlist_items.index(index) + 1
+                        except ValueError:
+                            current_item = min(item_total, current_item + 1)
+                        item_total = max(1, job.item_count)
+                    else:
+                        current_item = max(1, index)
+                        item_total = max(item_total, reported_total)
                     status = f"{job.title} - 항목 {current_item}/{item_total}"
                     self.progress.emit(_overall_percent(completed_items, current_item, 0, total_items), 0.0, status)
 
@@ -214,6 +228,7 @@ class MainWindow(QMainWindow):
         self._settings = load_settings()
         self._preview_info: MediaInfo | None = None
         self._preview_name_token = ""
+        self._excluded_preview_indexes: set[int] = set()
         self._queue: list[QueueJob] = []
         self._info_thread: QThread | None = None
         self._info_worker: MetadataWorker | None = None
@@ -284,12 +299,15 @@ class MainWindow(QMainWindow):
         self.open_folder_on_finish_checkbox = QCheckBox("완료 후 저장 폴더 열기")
         self.open_folder_on_finish_checkbox.setChecked(bool(self._settings.get("open_folder_on_finish", False)))
 
-        self.preview_button = QPushButton("1. 목록 불러오기")
+        self.preview_button = QPushButton("1 목록")
+        self.preview_button.setToolTip("URL의 받을 목록을 불러옵니다.")
         self.preview_button.clicked.connect(self.load_preview)
-        self.add_queue_button = QPushButton("2. 대기열 추가")
+        self.add_queue_button = QPushButton("2 추가")
+        self.add_queue_button.setToolTip("현재 받을 목록을 대기열에 추가합니다.")
         self.add_queue_button.setEnabled(False)
         self.add_queue_button.clicked.connect(self.add_preview_to_queue)
-        self.download_button = QPushButton("3. 다운로드 시작")
+        self.download_button = QPushButton("3 시작")
+        self.download_button.setToolTip("대기열 다운로드를 시작합니다.")
         self.download_button.clicked.connect(self.start_download)
         self.cancel_button = QPushButton("일시정지")
         self.cancel_button.setEnabled(False)
@@ -297,7 +315,8 @@ class MainWindow(QMainWindow):
         self.resume_button = QPushButton("이어받기")
         self.resume_button.setEnabled(False)
         self.resume_button.clicked.connect(self.resume_download)
-        self.clear_queue_button = QPushButton("대기열 비우기")
+        self.clear_queue_button = QPushButton("비우기")
+        self.clear_queue_button.setToolTip("대기열을 비웁니다.")
         self.clear_queue_button.clicked.connect(self.clear_queue)
         self.move_up_button = QPushButton("위로")
         self.move_up_button.clicked.connect(self.move_queue_item_up)
@@ -316,6 +335,12 @@ class MainWindow(QMainWindow):
         self.open_output_button.clicked.connect(self.open_output_folder)
         self.open_report_button = QPushButton("세션 리포트 열기")
         self.open_report_button.clicked.connect(self.open_session_report)
+        self.exclude_preview_button = QPushButton("선택 제외")
+        self.exclude_preview_button.setEnabled(False)
+        self.exclude_preview_button.clicked.connect(self.exclude_preview_selection)
+        self.restore_preview_button = QPushButton("전체 복원")
+        self.restore_preview_button.setEnabled(False)
+        self.restore_preview_button.clicked.connect(self.restore_preview_items)
 
         self.dependency_label = QLabel()
         self.refresh_button = QPushButton("상태 새로고침")
@@ -415,14 +440,21 @@ class MainWindow(QMainWindow):
         input_layout.addWidget(self.subtitle_combo, 6, 1, 1, 3)
         input_layout.addWidget(self.open_folder_on_finish_checkbox, 7, 1, 1, 3)
 
-        action_layout = QHBoxLayout()
-        action_layout.addWidget(self.preview_button)
-        action_layout.addWidget(self.add_queue_button)
-        action_layout.addWidget(self.download_button)
-        action_layout.addWidget(self.cancel_button)
-        action_layout.addWidget(self.resume_button)
-        action_layout.addWidget(self.clear_queue_button)
-        action_layout.addStretch(1)
+        action_layout = QGridLayout()
+        action_buttons = [
+            self.preview_button,
+            self.add_queue_button,
+            self.download_button,
+            self.cancel_button,
+            self.resume_button,
+            self.clear_queue_button,
+        ]
+        for column, button in enumerate(action_buttons[:3]):
+            button.setMinimumWidth(96)
+            action_layout.addWidget(button, 0, column)
+        for column, button in enumerate(action_buttons[3:]):
+            button.setMinimumWidth(96)
+            action_layout.addWidget(button, 1, column)
 
         progress_group = QGroupBox("진행 상태")
         progress_layout = QGridLayout(progress_group)
@@ -445,6 +477,11 @@ class MainWindow(QMainWindow):
         preview_layout = QVBoxLayout(preview_group)
         preview_layout.addWidget(self.preview_title_label)
         preview_layout.addWidget(self.preview_table)
+        preview_action_layout = QHBoxLayout()
+        preview_action_layout.addWidget(self.exclude_preview_button)
+        preview_action_layout.addWidget(self.restore_preview_button)
+        preview_action_layout.addStretch(1)
+        preview_layout.addLayout(preview_action_layout)
 
         queue_group = QGroupBox("다운로드 대기열")
         queue_layout = QVBoxLayout(queue_group)
@@ -611,8 +648,8 @@ class MainWindow(QMainWindow):
         if self._preview_info is None:
             return
         request = self._current_request(self._preview_info, require_output=False)
-        for row, entry in enumerate(self._preview_info.entries):
-            self.preview_table.setItem(row, 3, QTableWidgetItem(preview_filename(entry.title, row + 1, request)))
+        for row, (original_index, entry) in enumerate(self._visible_preview_entries()):
+            self.preview_table.setItem(row, 3, QTableWidgetItem(preview_filename(entry.title, original_index, request)))
 
     @Slot()
     def load_preview(self) -> None:
@@ -631,6 +668,7 @@ class MainWindow(QMainWindow):
         self.preview_table.setRowCount(0)
         self._preview_info = None
         self._preview_name_token = ""
+        self._excluded_preview_indexes.clear()
         self.folder_name_input.clear()
 
         self._info_thread = QThread(self)
@@ -654,18 +692,45 @@ class MainWindow(QMainWindow):
         signals_blocked = self.folder_name_input.blockSignals(True)
         self.folder_name_input.setText(info.title)
         self.folder_name_input.blockSignals(signals_blocked)
-        self.preview_title_label.setText(f"{info.title} - {info.item_count}개 항목")
-        self.preview_table.setRowCount(0)
-        for index, entry in enumerate(info.entries, start=1):
-            row = self.preview_table.rowCount()
-            self.preview_table.insertRow(row)
-            self.preview_table.setItem(row, 0, QTableWidgetItem(str(index)))
-            self.preview_table.setItem(row, 1, QTableWidgetItem(entry.title))
-            self.preview_table.setItem(row, 2, QTableWidgetItem(_format_duration(entry.duration)))
-        self.refresh_preview_filenames()
+        self._excluded_preview_indexes.clear()
+        self._render_preview_table()
         self.add_queue_button.setEnabled(True)
         self.preview_button.setEnabled(True)
         self._append_log(f"목록 분석 완료: {info.title} ({info.item_count}개)")
+
+    def _render_preview_table(self) -> None:
+        if self._preview_info is None:
+            self.preview_table.setRowCount(0)
+            self.exclude_preview_button.setEnabled(False)
+            self.restore_preview_button.setEnabled(False)
+            return
+
+        visible_entries = self._visible_preview_entries()
+        total = len(self._preview_info.entries)
+        excluded = len(self._excluded_preview_indexes)
+        self.preview_title_label.setText(f"{self._preview_info.title} - 받을 항목 {len(visible_entries)}개 / 전체 {total}개 / 제외 {excluded}개")
+        self.preview_table.setRowCount(0)
+        for original_index, entry in visible_entries:
+            row = self.preview_table.rowCount()
+            self.preview_table.insertRow(row)
+            index_item = QTableWidgetItem(str(original_index))
+            index_item.setData(Qt.ItemDataRole.UserRole, original_index)
+            self.preview_table.setItem(row, 0, index_item)
+            self.preview_table.setItem(row, 1, QTableWidgetItem(entry.title))
+            self.preview_table.setItem(row, 2, QTableWidgetItem(_format_duration(entry.duration)))
+        self.exclude_preview_button.setEnabled(bool(visible_entries))
+        self.restore_preview_button.setEnabled(bool(self._excluded_preview_indexes))
+        self.add_queue_button.setEnabled(bool(visible_entries))
+        self.refresh_preview_filenames()
+
+    def _visible_preview_entries(self) -> list[tuple[int, MediaEntry]]:
+        if self._preview_info is None:
+            return []
+        return [
+            (index, entry)
+            for index, entry in enumerate(self._preview_info.entries, start=1)
+            if index not in self._excluded_preview_indexes
+        ]
 
     @Slot(str)
     def preview_failed(self, message: str) -> None:
@@ -673,6 +738,27 @@ class MainWindow(QMainWindow):
         self.preview_button.setEnabled(True)
         self._append_log(f"분석 오류: {message}")
         QMessageBox.critical(self, "목록 분석 실패", message)
+
+    @Slot()
+    def exclude_preview_selection(self) -> None:
+        selected_rows = self.preview_table.selectionModel().selectedRows()
+        if not selected_rows:
+            QMessageBox.information(self, "선택 없음", "받을 목록에서 제외할 항목을 선택하세요.")
+            return
+
+        for model_index in selected_rows:
+            item = self.preview_table.item(model_index.row(), 0)
+            if item is None:
+                continue
+            original_index = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(original_index, int):
+                self._excluded_preview_indexes.add(original_index)
+        self._render_preview_table()
+
+    @Slot()
+    def restore_preview_items(self) -> None:
+        self._excluded_preview_indexes.clear()
+        self._render_preview_table()
 
     @Slot()
     def _cleanup_info_worker(self) -> None:
@@ -703,12 +789,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "ffmpeg 필요", "MP3 변환 또는 MP4 병합에는 ffmpeg가 필요합니다.")
             return
 
+        visible_entries = self._visible_preview_entries()
+        if not visible_entries:
+            QMessageBox.warning(self, "받을 항목 없음", "모든 항목이 제외되어 다운로드할 항목이 없습니다.")
+            return
+
         request = self._current_request(self._preview_info, require_output=True)
+        playlist_items = tuple(index for index, _entry in visible_entries)
+        if len(playlist_items) != len(self._preview_info.entries):
+            request = replace(request, playlist_items=playlist_items)
         job = QueueJob(
             title=self._preview_info.title,
-            item_count=self._preview_info.item_count,
+            item_count=len(visible_entries),
             request=request,
-            entries=list(self._preview_info.entries),
+            entries=[entry for _index, entry in visible_entries],
         )
         self._queue.append(job)
         save_settings(
@@ -963,7 +1057,8 @@ class MainWindow(QMainWindow):
     def _build_audit_results(self, jobs: list[QueueJob]) -> list[AuditResult]:
         results: list[AuditResult] = []
         for job in jobs:
-            for index, entry in enumerate(job.entries, start=1):
+            for offset, entry in enumerate(job.entries, start=1):
+                index = _job_entry_index(job, offset)
                 results.append(self._audit_entry(job, entry, index))
         return results
 
@@ -973,7 +1068,7 @@ class MainWindow(QMainWindow):
 
         if expected_path.exists():
             if _file_size(expected_path) > 0:
-                return self._audit_result("정상", job, entry, index, expected_path, expected_path, "예상 파일명과 일치", "")
+                return self._audit_final_file(job, entry, index, expected_path, expected_path, "예상 파일명과 일치")
             return self._audit_result("확인 필요", job, entry, index, expected_path, expected_path, "0바이트 최종 파일", "파일 삭제 후 다시 받기")
 
         folder = expected_path.parent
@@ -984,7 +1079,7 @@ class MainWindow(QMainWindow):
             reason = "실제 저장 파일명 기준으로 확인"
             if _normalized_stem(final_match) != _normalized_stem(expected_path):
                 reason = f"예상 파일명과 다르지만 같은 항목으로 판단: {final_match.name}"
-            return self._audit_result("정상", job, entry, index, expected_path, final_match, reason, "")
+            return self._audit_final_file(job, entry, index, expected_path, final_match, reason)
 
         partial_candidates = [path for path in files if _is_intermediate_file(path)]
         partial_match = self._best_file_match(partial_candidates, expected_path, entry, index, job.request)
@@ -1014,6 +1109,32 @@ class MainWindow(QMainWindow):
             )
 
         return self._audit_result("누락", job, entry, index, expected_path, None, "최종 파일과 중간 파일을 찾지 못함", "문제 항목만 다시 받기")
+
+    def _audit_final_file(
+        self,
+        job: QueueJob,
+        entry: MediaEntry,
+        index: int,
+        expected_path: Path,
+        actual_path: Path,
+        base_reason: str,
+    ) -> AuditResult:
+        duration_check = _duration_check_note(actual_path, entry.duration)
+        if duration_check.status == "mismatch":
+            return self._audit_result(
+                "확인 필요",
+                job,
+                entry,
+                index,
+                expected_path,
+                actual_path,
+                f"{base_reason} / {duration_check.note}",
+                "파일 길이 확인 후 다시 받기",
+            )
+        reason = base_reason
+        if duration_check.note:
+            reason = f"{reason} / {duration_check.note}"
+        return self._audit_result("정상", job, entry, index, expected_path, actual_path, reason, "")
 
     def _audit_result(
         self,
@@ -1311,6 +1432,74 @@ def _is_intermediate_file(path: Path) -> bool:
     return path.suffix.lower() in {".webm", ".m4a", ".m4v"}
 
 
+def _job_entry_index(job: QueueJob, offset: int) -> int:
+    if job.request.playlist_items and 1 <= offset <= len(job.request.playlist_items):
+        return job.request.playlist_items[offset - 1]
+    return offset
+
+
+def _duration_check_note(path: Path, expected_duration: int | None) -> DurationCheck:
+    if expected_duration is None or expected_duration <= 0:
+        return DurationCheck("unknown", "목록 길이 정보 없음")
+
+    actual_duration = _media_duration_seconds(path)
+    if actual_duration is None:
+        return DurationCheck("unknown", "파일 길이 확인 불가")
+
+    tolerance = max(5.0, expected_duration * 0.05)
+    diff = abs(actual_duration - expected_duration)
+    if diff > tolerance:
+        return DurationCheck(
+            "mismatch",
+            f"길이 차이 큼: 목록 {_format_duration(expected_duration)}, 파일 {_format_duration(int(round(actual_duration)))}",
+        )
+    return DurationCheck("ok", f"길이 확인: {_format_duration(int(round(actual_duration)))}")
+
+
+def _media_duration_seconds(path: Path) -> float | None:
+    ffprobe = _ffprobe_path()
+    if ffprobe is None:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    if result.returncode != 0:
+        return None
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _ffprobe_path() -> str | None:
+    if found := shutil.which("ffprobe"):
+        return found
+    if ffmpeg := shutil.which("ffmpeg"):
+        candidate = Path(ffmpeg).with_name("ffprobe.exe" if sys.platform.startswith("win") else "ffprobe")
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def _file_match_score(path: Path, expected_path: Path, entry: MediaEntry, index: int, request: DownloadRequest) -> int:
     candidate_stem = _normalized_stem(path)
     expected_stem = _normalized_stem(expected_path)
@@ -1328,6 +1517,8 @@ def _file_match_score(path: Path, expected_path: Path, entry: MediaEntry, index:
     entry_signature = _title_signature(entry.title)
     expected_signature = _title_signature(expected_path.stem)
     signatures = {signature for signature in (entry_signature, expected_signature) if signature}
+    if candidate_signature and signatures and candidate_signature not in signatures:
+        return 0
     if candidate_signature and candidate_signature in signatures:
         return 95
 

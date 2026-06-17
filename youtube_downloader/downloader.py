@@ -55,6 +55,7 @@ class DownloadRequest:
     name_token: str = ""
     index_override: int | None = None
     subtitle_mode: str = "none"
+    playlist_items: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,9 @@ def build_command(request: DownloadRequest) -> list[str]:
         command.extend(["--no-overwrites", "--download-archive", str(request.output_dir / ".download_archive.txt")])
     else:
         raise ValueError(f"Unsupported duplicate mode: {request.duplicate_mode}")
+
+    if request.playlist_items:
+        command.extend(["--playlist-items", ",".join(str(item) for item in request.playlist_items)])
 
     js_runtime = _detect_js_runtime()
     if js_runtime is not None:
@@ -377,6 +381,8 @@ def _output_template(request: DownloadRequest) -> str:
     elif request.filename_mode in {"numbered", "playlist_folder"}:
         if request.index_override is not None:
             filename = f"{request.index_override:03d}_%(title)s{token}.%(ext)s"
+        elif request.playlist_items:
+            filename = f"%(playlist_index)03d_%(title)s{token}.%(ext)s"
         else:
             filename = f"%(autonumber)03d_%(title)s{token}.%(ext)s"
     else:
