@@ -43,6 +43,10 @@ class DownloadRequest:
     output_dir: Path
     mode: str
     quality: str = "best"
+    filename_mode: str = "title"
+    duplicate_mode: str = "skip"
+    collection_title: str = ""
+    name_token: str = ""
 
 
 @dataclass(frozen=True)
@@ -135,8 +139,19 @@ def build_command(request: DownloadRequest) -> list[str]:
         "-P",
         str(request.output_dir),
         "-o",
-        "%(title)s.%(ext)s",
+        _output_template(request),
     ]
+    if request.duplicate_mode == "skip":
+        command.append("--no-overwrites")
+    elif request.duplicate_mode == "overwrite":
+        command.append("--force-overwrites")
+    elif request.duplicate_mode == "unique":
+        command.append("--no-overwrites")
+    elif request.duplicate_mode == "archive":
+        command.extend(["--no-overwrites", "--download-archive", str(request.output_dir / ".download_archive.txt")])
+    else:
+        raise ValueError(f"Unsupported duplicate mode: {request.duplicate_mode}")
+
     js_runtime = _detect_js_runtime()
     if js_runtime is not None:
         command.extend(["--js-runtimes", js_runtime])
@@ -151,6 +166,20 @@ def build_command(request: DownloadRequest) -> list[str]:
 
     command.append(request.url)
     return command
+
+
+def preview_filename(title: str, index: int, request: DownloadRequest) -> str:
+    ext = "mp3" if request.mode == "audio" else "mp4"
+    safe_title = _safe_filename(title)
+    token = f"_{request.name_token}" if request.duplicate_mode == "unique" and request.name_token else ""
+    if request.filename_mode == "title":
+        return f"{safe_title}{token}.{ext}"
+    if request.filename_mode == "numbered":
+        return f"{index:03d}_{safe_title}{token}.{ext}"
+    if request.filename_mode == "playlist_folder":
+        folder = _safe_filename(request.collection_title or "playlist")
+        return f"{folder}/{index:03d}_{safe_title}{token}.{ext}"
+    raise ValueError(f"Unsupported filename mode: {request.filename_mode}")
 
 
 def fetch_media_info(url: str) -> MediaInfo:
@@ -225,6 +254,24 @@ def _detect_js_runtime() -> str | None:
     if shutil.which("bun"):
         return "bun"
     return None
+
+
+def _output_template(request: DownloadRequest) -> str:
+    token = f"_{request.name_token}" if request.duplicate_mode == "unique" and request.name_token else ""
+    if request.filename_mode == "title":
+        return f"%(title)s{token}.%(ext)s"
+    if request.filename_mode == "numbered":
+        return f"%(autonumber)03d_%(title)s{token}.%(ext)s"
+    if request.filename_mode == "playlist_folder":
+        folder = _safe_filename(request.collection_title or "playlist")
+        return f"{folder}/%(autonumber)03d_%(title)s{token}.%(ext)s"
+    raise ValueError(f"Unsupported filename mode: {request.filename_mode}")
+
+
+def _safe_filename(value: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.rstrip(". ") or "untitled"
 
 
 def _video_format_selector(quality: str) -> str:

@@ -14,6 +14,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "last_output_dir": str(Path.home() / "Downloads"),
     "last_mode": "video",
     "last_quality": "best",
+    "last_filename_mode": "title",
+    "last_duplicate_mode": "skip",
 }
 
 

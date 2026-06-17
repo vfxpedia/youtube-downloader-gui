@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
@@ -38,6 +39,7 @@ from .downloader import (
     MediaInfo,
     check_dependencies,
     fetch_media_info,
+    preview_filename,
     run_download,
 )
 from .settings import load_settings, save_settings
@@ -56,6 +58,19 @@ QUALITY_LABELS = {
     "720": "720p 이하",
     "480": "480p 이하",
     "360": "360p 이하",
+}
+
+FILENAME_MODE_LABELS = {
+    "title": "제목만",
+    "numbered": "001_번호 + 제목",
+    "playlist_folder": "재생목록 폴더/001_번호 + 제목",
+}
+
+DUPLICATE_MODE_LABELS = {
+    "skip": "이미 있으면 건너뛰기",
+    "overwrite": "덮어쓰기",
+    "unique": "새 이름으로 저장",
+    "archive": "다운로드 기록 기준 건너뛰기",
 }
 
 
@@ -154,6 +169,7 @@ class MainWindow(QMainWindow):
 
         self._settings = load_settings()
         self._preview_info: MediaInfo | None = None
+        self._preview_name_token = ""
         self._queue: list[QueueJob] = []
         self._info_thread: QThread | None = None
         self._info_worker: MetadataWorker | None = None
@@ -181,6 +197,20 @@ class MainWindow(QMainWindow):
         selected_quality = self.quality_combo.findData(self._settings.get("last_quality", "best"))
         self.quality_combo.setCurrentIndex(max(selected_quality, 0))
 
+        self.filename_mode_combo = QComboBox()
+        for mode, label in FILENAME_MODE_LABELS.items():
+            self.filename_mode_combo.addItem(label, mode)
+        selected_filename_mode = self.filename_mode_combo.findData(self._settings.get("last_filename_mode", "title"))
+        self.filename_mode_combo.setCurrentIndex(max(selected_filename_mode, 0))
+        self.filename_mode_combo.currentIndexChanged.connect(self.refresh_preview_filenames)
+
+        self.duplicate_mode_combo = QComboBox()
+        for mode, label in DUPLICATE_MODE_LABELS.items():
+            self.duplicate_mode_combo.addItem(label, mode)
+        selected_duplicate_mode = self.duplicate_mode_combo.findData(self._settings.get("last_duplicate_mode", "skip"))
+        self.duplicate_mode_combo.setCurrentIndex(max(selected_duplicate_mode, 0))
+        self.duplicate_mode_combo.currentIndexChanged.connect(self.refresh_preview_filenames)
+
         self.preview_button = QPushButton("목록 불러오기")
         self.preview_button.clicked.connect(self.load_preview)
         self.add_queue_button = QPushButton("대기열 추가")
@@ -193,6 +223,12 @@ class MainWindow(QMainWindow):
         self.cancel_button.clicked.connect(self.cancel_download)
         self.clear_queue_button = QPushButton("대기열 비우기")
         self.clear_queue_button.clicked.connect(self.clear_queue)
+        self.move_up_button = QPushButton("위로")
+        self.move_up_button.clicked.connect(self.move_queue_item_up)
+        self.move_down_button = QPushButton("아래로")
+        self.move_down_button.clicked.connect(self.move_queue_item_down)
+        self.remove_queue_button = QPushButton("삭제")
+        self.remove_queue_button.clicked.connect(self.remove_queue_item)
 
         self.dependency_label = QLabel()
         self.refresh_button = QPushButton("상태 새로고침")
@@ -207,12 +243,12 @@ class MainWindow(QMainWindow):
 
         self.preview_title_label = QLabel("URL을 분석하면 받을 항목이 여기에 표시됩니다.")
         self.preview_title_label.setWordWrap(True)
-        self.preview_table = QTableWidget(0, 3)
-        self.preview_table.setHorizontalHeaderLabels(["#", "제목", "길이"])
+        self.preview_table = QTableWidget(0, 4)
+        self.preview_table.setHorizontalHeaderLabels(["#", "제목", "길이", "예상 파일명"])
         self._setup_table(self.preview_table)
 
-        self.queue_table = QTableWidget(0, 5)
-        self.queue_table.setHorizontalHeaderLabels(["제목", "항목", "형식", "화질", "URL"])
+        self.queue_table = QTableWidget(0, 7)
+        self.queue_table.setHorizontalHeaderLabels(["제목", "항목", "형식", "화질", "파일명", "중복 처리", "URL"])
         self._setup_table(self.queue_table)
 
         self.log_view = QTextEdit()
@@ -260,6 +296,10 @@ class MainWindow(QMainWindow):
         input_layout.addWidget(self.mode_combo, 2, 1)
         input_layout.addWidget(QLabel("화질"), 2, 2)
         input_layout.addWidget(self.quality_combo, 2, 3)
+        input_layout.addWidget(QLabel("파일명"), 3, 0)
+        input_layout.addWidget(self.filename_mode_combo, 3, 1)
+        input_layout.addWidget(QLabel("중복"), 3, 2)
+        input_layout.addWidget(self.duplicate_mode_combo, 3, 3)
 
         action_layout = QHBoxLayout()
         action_layout.addWidget(self.preview_button)
@@ -294,6 +334,12 @@ class MainWindow(QMainWindow):
         queue_group = QGroupBox("다운로드 대기열")
         queue_layout = QVBoxLayout(queue_group)
         queue_layout.addWidget(self.queue_table)
+        queue_action_layout = QHBoxLayout()
+        queue_action_layout.addWidget(self.move_up_button)
+        queue_action_layout.addWidget(self.move_down_button)
+        queue_action_layout.addWidget(self.remove_queue_button)
+        queue_action_layout.addStretch(1)
+        queue_layout.addLayout(queue_action_layout)
 
         left_layout.addWidget(input_group)
         left_layout.addLayout(action_layout)
@@ -370,6 +416,16 @@ class MainWindow(QMainWindow):
         is_video = self.mode_combo.currentData() == "video"
         self.quality_combo.setEnabled(is_video)
         self.quality_combo.setToolTip("" if is_video else "음원 MP3는 최고 음질로 추출합니다.")
+        self.refresh_preview_filenames()
+
+    @Slot()
+    @Slot(int)
+    def refresh_preview_filenames(self, _index: int | None = None) -> None:
+        if self._preview_info is None:
+            return
+        request = self._current_request(self._preview_info, require_output=False)
+        for row, entry in enumerate(self._preview_info.entries):
+            self.preview_table.setItem(row, 3, QTableWidgetItem(preview_filename(entry.title, row + 1, request)))
 
     @Slot()
     def load_preview(self) -> None:
@@ -387,6 +443,7 @@ class MainWindow(QMainWindow):
         self.preview_title_label.setText("URL 분석 중...")
         self.preview_table.setRowCount(0)
         self._preview_info = None
+        self._preview_name_token = ""
 
         self._info_thread = QThread(self)
         self._info_worker = MetadataWorker(url)
@@ -410,6 +467,7 @@ class MainWindow(QMainWindow):
             self.preview_table.setItem(row, 0, QTableWidgetItem(str(index)))
             self.preview_table.setItem(row, 1, QTableWidgetItem(entry.title))
             self.preview_table.setItem(row, 2, QTableWidgetItem(_format_duration(entry.duration)))
+        self.refresh_preview_filenames()
         self.add_queue_button.setEnabled(True)
         self.preview_button.setEnabled(True)
         self._append_log(f"목록 분석 완료: {info.title} ({info.item_count}개)")
@@ -441,27 +499,53 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "저장 위치 필요", "저장 위치를 선택하세요.")
             return
 
-        mode = str(self.mode_combo.currentData())
-        quality = str(self.quality_combo.currentData())
         status = check_dependencies()
         if not status.yt_dlp_ready:
             QMessageBox.warning(self, "yt-dlp 설치 필요", "run_app.bat로 실행해 필요한 패키지를 설치하세요.")
             return
+        mode = str(self.mode_combo.currentData())
         if mode in {"audio", "video"} and not status.ffmpeg_ready:
             QMessageBox.warning(self, "ffmpeg 필요", "MP3 변환 또는 MP4 병합에는 ffmpeg가 필요합니다.")
             return
 
-        request = DownloadRequest(
-            url=self._preview_info.url,
-            output_dir=Path(output_text),
-            mode=mode,
-            quality=quality,
-        )
+        request = self._current_request(self._preview_info, require_output=True)
         job = QueueJob(title=self._preview_info.title, item_count=self._preview_info.item_count, request=request)
         self._queue.append(job)
-        save_settings({"last_output_dir": output_text, "last_mode": mode, "last_quality": quality})
+        save_settings(
+            {
+                "last_output_dir": output_text,
+                "last_mode": request.mode,
+                "last_quality": request.quality,
+                "last_filename_mode": request.filename_mode,
+                "last_duplicate_mode": request.duplicate_mode,
+            }
+        )
         self._append_queue_row(job)
         self._append_log(f"대기열 추가: {job.title} ({job.item_count}개)")
+        if request.duplicate_mode == "unique":
+            self._preview_name_token = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.refresh_preview_filenames()
+
+    def _current_request(self, info: MediaInfo, require_output: bool) -> DownloadRequest:
+        output_text = self.output_input.text().strip()
+        output_dir = Path(output_text) if output_text else Path(self._settings["last_output_dir"])
+        if require_output and not output_text:
+            raise ValueError("저장 위치를 선택하세요.")
+
+        duplicate_mode = str(self.duplicate_mode_combo.currentData())
+        if duplicate_mode == "unique" and not self._preview_name_token:
+            self._preview_name_token = datetime.now().strftime("%Y%m%d_%H%M%S")
+        name_token = self._preview_name_token if duplicate_mode == "unique" else ""
+        return DownloadRequest(
+            url=info.url,
+            output_dir=output_dir,
+            mode=str(self.mode_combo.currentData()),
+            quality=str(self.quality_combo.currentData()),
+            filename_mode=str(self.filename_mode_combo.currentData()),
+            duplicate_mode=duplicate_mode,
+            collection_title=info.title,
+            name_token=name_token,
+        )
 
     def _append_queue_row(self, job: QueueJob) -> None:
         row = self.queue_table.rowCount()
@@ -471,7 +555,47 @@ class MainWindow(QMainWindow):
         self.queue_table.setItem(row, 2, QTableWidgetItem(MODE_LABELS.get(job.request.mode, job.request.mode)))
         quality = QUALITY_LABELS.get(job.request.quality, job.request.quality) if job.request.mode == "video" else "최고 음질"
         self.queue_table.setItem(row, 3, QTableWidgetItem(quality))
-        self.queue_table.setItem(row, 4, QTableWidgetItem(job.request.url))
+        self.queue_table.setItem(row, 4, QTableWidgetItem(FILENAME_MODE_LABELS.get(job.request.filename_mode, job.request.filename_mode)))
+        self.queue_table.setItem(row, 5, QTableWidgetItem(DUPLICATE_MODE_LABELS.get(job.request.duplicate_mode, job.request.duplicate_mode)))
+        self.queue_table.setItem(row, 6, QTableWidgetItem(job.request.url))
+
+    def _selected_queue_row(self) -> int | None:
+        selected = self.queue_table.selectionModel().selectedRows()
+        if not selected:
+            return None
+        return selected[0].row()
+
+    @Slot()
+    def move_queue_item_up(self) -> None:
+        row = self._selected_queue_row()
+        if row is None or row <= 0 or self._download_worker is not None:
+            return
+        self._queue[row - 1], self._queue[row] = self._queue[row], self._queue[row - 1]
+        self._refresh_queue_table(row - 1)
+
+    @Slot()
+    def move_queue_item_down(self) -> None:
+        row = self._selected_queue_row()
+        if row is None or row >= len(self._queue) - 1 or self._download_worker is not None:
+            return
+        self._queue[row + 1], self._queue[row] = self._queue[row], self._queue[row + 1]
+        self._refresh_queue_table(row + 1)
+
+    @Slot()
+    def remove_queue_item(self) -> None:
+        row = self._selected_queue_row()
+        if row is None or self._download_worker is not None:
+            return
+        removed = self._queue.pop(row)
+        self._refresh_queue_table(min(row, len(self._queue) - 1))
+        self._append_log(f"대기열 삭제: {removed.title}")
+
+    def _refresh_queue_table(self, select_row: int | None = None) -> None:
+        self.queue_table.setRowCount(0)
+        for job in self._queue:
+            self._append_queue_row(job)
+        if select_row is not None and select_row >= 0:
+            self.queue_table.selectRow(select_row)
 
     @Slot()
     def clear_queue(self) -> None:
@@ -575,6 +699,9 @@ class MainWindow(QMainWindow):
         self.download_button.setEnabled(not running)
         self.cancel_button.setEnabled(running)
         self.clear_queue_button.setEnabled(not running)
+        self.move_up_button.setEnabled(not running)
+        self.move_down_button.setEnabled(not running)
+        self.remove_queue_button.setEnabled(not running)
 
     def _notify(self, title: str, message: str) -> None:
         if self.tray_icon.isVisible():
