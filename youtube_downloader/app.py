@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -37,6 +38,7 @@ from .downloader import (
     DownloadCancelled,
     DownloadError,
     DownloadRequest,
+    MediaEntry,
     MediaInfo,
     check_dependencies,
     fetch_media_info,
@@ -84,6 +86,17 @@ class QueueJob:
     title: str
     item_count: int
     request: DownloadRequest
+    entries: list[MediaEntry]
+
+
+@dataclass(frozen=True)
+class AuditResult:
+    status: str
+    job_title: str
+    index: int
+    title: str
+    expected_path: Path
+    note: str
 
 
 class MetadataWorker(QObject):
@@ -181,6 +194,8 @@ class MainWindow(QMainWindow):
         self._download_thread: QThread | None = None
         self._download_worker: DownloadWorker | None = None
         self._continue_after_cleanup = False
+        self._active_jobs: list[QueueJob] = []
+        self._session_log_path: Path | None = None
 
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("YouTube 영상 또는 재생목록 URL")
@@ -272,6 +287,14 @@ class MainWindow(QMainWindow):
         self.queue_table.setHorizontalHeaderLabels(["제목", "항목", "형식", "화질", "저장 폴더", "파일명", "중복 처리", "URL"])
         self._setup_table(self.queue_table)
         self._set_column_widths(self.queue_table, [240, 70, 100, 110, 240, 160, 180, 360])
+
+        self.result_summary_label = QLabel("다운로드 후 결과 검증이 여기에 표시됩니다.")
+        self.result_summary_label.setWordWrap(True)
+        self.result_table = QTableWidget(0, 6)
+        self.result_table.setHorizontalHeaderLabels(["상태", "작업", "#", "제목", "예상 파일", "메모"])
+        self._setup_table(self.result_table)
+        self._set_column_widths(self.result_table, [82, 220, 54, 300, 480, 220])
+        self.result_table.setSortingEnabled(True)
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
@@ -375,14 +398,23 @@ class MainWindow(QMainWindow):
         queue_action_layout.addStretch(1)
         queue_layout.addLayout(queue_action_layout)
 
+        result_group = QGroupBox("결과 검증")
+        result_layout = QVBoxLayout(result_group)
+        result_layout.addWidget(self.result_summary_label)
+        result_layout.addWidget(self.result_table)
+
+        right_tabs = QTabWidget()
+        right_tabs.addTab(preview_group, "받을 목록")
+        right_tabs.addTab(queue_group, "대기열")
+        right_tabs.addTab(result_group, "결과 검증")
+
         left_layout.addWidget(input_group)
         left_layout.addLayout(action_layout)
         left_layout.addWidget(progress_group)
         left_layout.addWidget(dependency_group)
         left_layout.addWidget(log_group, 1)
 
-        right_layout.addWidget(preview_group, 1)
-        right_layout.addWidget(queue_group, 1)
+        right_layout.addWidget(right_tabs, 1)
 
         splitter.addWidget(left)
         splitter.addWidget(right)
@@ -558,7 +590,12 @@ class MainWindow(QMainWindow):
             return
 
         request = self._current_request(self._preview_info, require_output=True)
-        job = QueueJob(title=self._preview_info.title, item_count=self._preview_info.item_count, request=request)
+        job = QueueJob(
+            title=self._preview_info.title,
+            item_count=self._preview_info.item_count,
+            request=request,
+            entries=list(self._preview_info.entries),
+        )
         self._queue.append(job)
         save_settings(
             {
@@ -675,11 +712,18 @@ class MainWindow(QMainWindow):
             return
 
         jobs = list(self._queue)
+        self._active_jobs = jobs
+        self._session_log_path = self._create_session_log_path(jobs)
         self._queue.clear()
         self.queue_table.setRowCount(0)
+        self.result_table.setSortingEnabled(False)
+        self.result_table.setRowCount(0)
+        self.result_table.setSortingEnabled(True)
+        self.result_summary_label.setText("다운로드가 끝나면 예상 파일과 실제 파일을 자동 검증합니다.")
         self.overall_progress_bar.setValue(0)
         self.current_progress_bar.setValue(0)
         self.status_label.setText("다운로드 준비 중")
+        self._append_log(f"세션 로그 파일: {self._session_log_path}")
 
         self._download_thread = QThread(self)
         self._download_worker = DownloadWorker(jobs)
@@ -716,6 +760,7 @@ class MainWindow(QMainWindow):
         self.current_progress_bar.setValue(100)
         self.status_label.setText("완료")
         self._append_log("작업이 완료되었습니다.")
+        self._audit_active_jobs("완료")
         self._set_running(False)
         if self._queue:
             self._append_log("새로 추가된 대기열을 이어서 다운로드합니다.")
@@ -727,6 +772,7 @@ class MainWindow(QMainWindow):
     def download_cancelled(self) -> None:
         self.status_label.setText("취소됨")
         self._append_log("작업이 취소되었습니다.")
+        self._audit_active_jobs("취소 후 검증")
         self._set_running(False)
         self._notify("다운로드 취소", "다운로드가 취소되었습니다.")
 
@@ -734,6 +780,7 @@ class MainWindow(QMainWindow):
     def download_failed(self, message: str) -> None:
         self.status_label.setText("오류")
         self._append_log(f"오류: {message}")
+        self._audit_active_jobs("오류 후 검증")
         self._set_running(False)
         self._notify("다운로드 실패", "자세한 원인은 앱 로그와 실패 팝업을 확인하세요.")
         QMessageBox.critical(self, "다운로드 실패", message)
@@ -750,9 +797,110 @@ class MainWindow(QMainWindow):
             self._continue_after_cleanup = False
             self.start_download()
 
+    def _create_session_log_path(self, jobs: list[QueueJob]) -> Path:
+        output_dir = jobs[0].request.output_dir if jobs else Path(self._settings["last_output_dir"])
+        report_dir = output_dir / "_download_reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return report_dir / f"download_{stamp}.log"
+
+    def _audit_active_jobs(self, label: str) -> None:
+        if not self._active_jobs:
+            self.result_summary_label.setText("검증할 다운로드 작업이 없습니다.")
+            return
+
+        results = self._build_audit_results(self._active_jobs)
+        self._display_audit_results(label, results)
+        self._write_audit_log(label, results)
+
+    def _build_audit_results(self, jobs: list[QueueJob]) -> list[AuditResult]:
+        results: list[AuditResult] = []
+        for job in jobs:
+            for index, entry in enumerate(job.entries, start=1):
+                expected_path = self._expected_file_path(job.request, entry, index)
+                if expected_path.exists() and expected_path.stat().st_size > 0:
+                    status = "정상"
+                    note = f"{expected_path.stat().st_size / 1024 / 1024:.1f} MB"
+                elif expected_path.exists():
+                    status = "크기 이상"
+                    note = "0바이트 파일입니다."
+                elif alternative_path := self._find_alternative_file(expected_path):
+                    status = "파일명 차이"
+                    note = f"비슷한 파일 발견: {alternative_path.name}"
+                else:
+                    status = "누락"
+                    note = "예상 파일을 찾지 못했습니다."
+                results.append(
+                    AuditResult(
+                        status=status,
+                        job_title=job.title,
+                        index=index,
+                        title=entry.title,
+                        expected_path=expected_path,
+                        note=note,
+                    )
+                )
+        return results
+
+    def _expected_file_path(self, request: DownloadRequest, entry: MediaEntry, index: int) -> Path:
+        relative = preview_filename(entry.title, index, request)
+        return request.output_dir.joinpath(*relative.split("/"))
+
+    def _find_alternative_file(self, expected_path: Path) -> Path | None:
+        if not expected_path.parent.exists():
+            return None
+        candidates = sorted(
+            (path for path in expected_path.parent.iterdir() if path.is_file() and path.stem == expected_path.stem),
+            key=lambda path: path.stat().st_size if path.exists() else 0,
+            reverse=True,
+        )
+        for candidate in candidates:
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return candidate
+        return None
+
+    def _display_audit_results(self, label: str, results: list[AuditResult]) -> None:
+        ok_count = sum(1 for result in results if result.status == "정상")
+        missing_count = sum(1 for result in results if result.status == "누락")
+        suspicious_count = sum(1 for result in results if result.status == "크기 이상")
+        renamed_count = sum(1 for result in results if result.status == "파일명 차이")
+        self.result_summary_label.setText(
+            f"{label}: 총 {len(results)}개 중 정상 {ok_count}개, 파일명 차이 {renamed_count}개, 누락 {missing_count}개, 크기 이상 {suspicious_count}개"
+        )
+
+        self.result_table.setSortingEnabled(False)
+        self.result_table.setRowCount(0)
+        for result in results:
+            row = self.result_table.rowCount()
+            self.result_table.insertRow(row)
+            values = [
+                result.status,
+                result.job_title,
+                str(result.index),
+                result.title,
+                str(result.expected_path),
+                result.note,
+            ]
+            for column, value in enumerate(values):
+                self.result_table.setItem(row, column, QTableWidgetItem(value))
+        self.result_table.setSortingEnabled(True)
+
+    def _write_audit_log(self, label: str, results: list[AuditResult]) -> None:
+        self._append_log(f"결과 검증: {self.result_summary_label.text()}")
+        for result in results:
+            if result.status != "정상":
+                self._append_log(f"[{label}] {result.status}: {result.index}. {result.title} -> {result.expected_path}")
+
     @Slot(str)
     def _append_log(self, message: str) -> None:
         self.log_view.append(message)
+        if self._session_log_path is not None:
+            try:
+                self._session_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with self._session_log_path.open("a", encoding="utf-8") as file:
+                    file.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}\n")
+            except OSError:
+                pass
         scrollbar = self.log_view.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 

@@ -33,6 +33,8 @@ def load_settings() -> dict[str, Any]:
     settings = DEFAULT_SETTINGS.copy()
     if isinstance(loaded, dict):
         settings.update({key: value for key, value in loaded.items() if key in settings})
+    if not Path(str(settings["last_output_dir"])).exists():
+        settings["last_output_dir"] = DEFAULT_SETTINGS["last_output_dir"]
     return settings
 
 
