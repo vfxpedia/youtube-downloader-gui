@@ -8,6 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
     QFileDialog,
@@ -200,6 +201,7 @@ class MainWindow(QMainWindow):
             self.quality_combo.addItem(label, quality)
         selected_quality = self.quality_combo.findData(self._settings.get("last_quality", "best"))
         self.quality_combo.setCurrentIndex(max(selected_quality, 0))
+        self.quality_combo.currentIndexChanged.connect(self.refresh_preview_filenames)
 
         self.filename_mode_combo = QComboBox()
         for mode, label in FILENAME_MODE_LABELS.items():
@@ -216,7 +218,11 @@ class MainWindow(QMainWindow):
             self.folder_mode_combo.addItem(label, mode)
         selected_folder_mode = self.folder_mode_combo.findData(self._settings.get("last_folder_mode", "playlist"))
         self.folder_mode_combo.setCurrentIndex(max(selected_folder_mode, 0))
-        self.folder_mode_combo.currentIndexChanged.connect(self.refresh_preview_filenames)
+        self.folder_mode_combo.currentIndexChanged.connect(self.update_folder_controls)
+
+        self.folder_name_input = QLineEdit()
+        self.folder_name_input.setPlaceholderText("목록을 불러오면 재생목록명이 들어갑니다.")
+        self.folder_name_input.textChanged.connect(self.refresh_preview_filenames)
 
         self.duplicate_mode_combo = QComboBox()
         for mode, label in DUPLICATE_MODE_LABELS.items():
@@ -260,10 +266,12 @@ class MainWindow(QMainWindow):
         self.preview_table = QTableWidget(0, 4)
         self.preview_table.setHorizontalHeaderLabels(["#", "제목", "길이", "예상 파일명"])
         self._setup_table(self.preview_table)
+        self._set_column_widths(self.preview_table, [54, 320, 80, 520])
 
         self.queue_table = QTableWidget(0, 8)
-        self.queue_table.setHorizontalHeaderLabels(["제목", "항목", "형식", "화질", "폴더", "파일명", "중복 처리", "URL"])
+        self.queue_table.setHorizontalHeaderLabels(["제목", "항목", "형식", "화질", "저장 폴더", "파일명", "중복 처리", "URL"])
         self._setup_table(self.queue_table)
+        self._set_column_widths(self.queue_table, [240, 70, 100, 110, 240, 160, 180, 360])
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
@@ -279,13 +287,21 @@ class MainWindow(QMainWindow):
         self._apply_style()
         self.refresh_dependencies()
         self.update_quality_enabled()
+        self.update_folder_controls()
 
     def _setup_table(self, table: QTableWidget) -> None:
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        table.setWordWrap(False)
         table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionsMovable(True)
+        table.horizontalHeader().setStretchLastSection(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+
+    def _set_column_widths(self, table: QTableWidget, widths: list[int]) -> None:
+        for column, width in enumerate(widths):
+            table.setColumnWidth(column, width)
 
     def _build_layout(self) -> None:
         central = QWidget()
@@ -314,8 +330,10 @@ class MainWindow(QMainWindow):
         input_layout.addWidget(self.filename_mode_combo, 3, 1)
         input_layout.addWidget(QLabel("폴더"), 3, 2)
         input_layout.addWidget(self.folder_mode_combo, 3, 3)
-        input_layout.addWidget(QLabel("중복"), 4, 0)
-        input_layout.addWidget(self.duplicate_mode_combo, 4, 1, 1, 3)
+        input_layout.addWidget(QLabel("폴더명"), 4, 0)
+        input_layout.addWidget(self.folder_name_input, 4, 1, 1, 3)
+        input_layout.addWidget(QLabel("중복"), 5, 0)
+        input_layout.addWidget(self.duplicate_mode_combo, 5, 1, 1, 3)
 
         action_layout = QHBoxLayout()
         action_layout.addWidget(self.preview_button)
@@ -436,6 +454,17 @@ class MainWindow(QMainWindow):
 
     @Slot()
     @Slot(int)
+    def update_folder_controls(self, _index: int | None = None) -> None:
+        uses_playlist_folder = self.folder_mode_combo.currentData() == "playlist"
+        self.folder_name_input.setEnabled(uses_playlist_folder)
+        if uses_playlist_folder:
+            self.folder_name_input.setPlaceholderText("재생목록명 또는 직접 입력한 폴더명")
+        else:
+            self.folder_name_input.setPlaceholderText("선택한 저장 위치에 바로 저장됩니다.")
+        self.refresh_preview_filenames()
+
+    @Slot()
+    @Slot(int)
     def refresh_preview_filenames(self, _index: int | None = None) -> None:
         if self._preview_info is None:
             return
@@ -460,6 +489,7 @@ class MainWindow(QMainWindow):
         self.preview_table.setRowCount(0)
         self._preview_info = None
         self._preview_name_token = ""
+        self.folder_name_input.clear()
 
         self._info_thread = QThread(self)
         self._info_worker = MetadataWorker(url)
@@ -475,6 +505,9 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def preview_loaded(self, info: MediaInfo) -> None:
         self._preview_info = info
+        signals_blocked = self.folder_name_input.blockSignals(True)
+        self.folder_name_input.setText(info.title)
+        self.folder_name_input.blockSignals(signals_blocked)
         self.preview_title_label.setText(f"{info.title} - {info.item_count}개 항목")
         self.preview_table.setRowCount(0)
         for index, entry in enumerate(info.entries, start=1):
@@ -561,9 +594,13 @@ class MainWindow(QMainWindow):
             filename_mode=str(self.filename_mode_combo.currentData()),
             folder_mode=str(self.folder_mode_combo.currentData()),
             duplicate_mode=duplicate_mode,
-            collection_title=info.title,
+            collection_title=self._current_collection_title(info),
             name_token=name_token,
         )
+
+    def _current_collection_title(self, info: MediaInfo) -> str:
+        custom_folder_name = self.folder_name_input.text().strip()
+        return custom_folder_name or info.title
 
     def _append_queue_row(self, job: QueueJob) -> None:
         row = self.queue_table.rowCount()
@@ -573,10 +610,15 @@ class MainWindow(QMainWindow):
         self.queue_table.setItem(row, 2, QTableWidgetItem(MODE_LABELS.get(job.request.mode, job.request.mode)))
         quality = QUALITY_LABELS.get(job.request.quality, job.request.quality) if job.request.mode == "video" else "최고 음질"
         self.queue_table.setItem(row, 3, QTableWidgetItem(quality))
-        self.queue_table.setItem(row, 4, QTableWidgetItem(FOLDER_MODE_LABELS.get(job.request.folder_mode, job.request.folder_mode)))
+        self.queue_table.setItem(row, 4, QTableWidgetItem(self._queue_folder_text(job.request)))
         self.queue_table.setItem(row, 5, QTableWidgetItem(FILENAME_MODE_LABELS.get(job.request.filename_mode, job.request.filename_mode)))
         self.queue_table.setItem(row, 6, QTableWidgetItem(DUPLICATE_MODE_LABELS.get(job.request.duplicate_mode, job.request.duplicate_mode)))
         self.queue_table.setItem(row, 7, QTableWidgetItem(job.request.url))
+
+    def _queue_folder_text(self, request: DownloadRequest) -> str:
+        if request.folder_mode == "root":
+            return "선택 폴더 바로 저장"
+        return request.collection_title or "재생목록명"
 
     def _selected_queue_row(self) -> int | None:
         selected = self.queue_table.selectionModel().selectedRows()
