@@ -1,0 +1,50 @@
+# YouTube Playlist Downloader
+
+Windows에서 YouTube 단일 영상 또는 재생목록을 GUI로 다운로드하는 도구입니다.
+
+## 실행 방법
+
+1. `run_app.bat`를 더블클릭합니다.
+2. 처음 실행할 때 `.venv` 가상환경을 만들고 `PySide6`, `yt-dlp`를 설치합니다.
+3. 앱이 열리면 YouTube URL, 저장 위치, 다운로드 형식을 선택합니다.
+4. `다운로드 시작`을 누릅니다.
+
+## 필요한 도구
+
+- Python 3.10 이상
+- `yt-dlp`: `run_app.bat`가 자동 설치합니다.
+- `ffmpeg`: MP3 변환 또는 고화질 영상 병합에 필요합니다.
+- Node.js, Deno 또는 Bun: 최신 YouTube 추출에서 JavaScript 런타임이 필요할 수 있습니다.
+
+현재 PC에서는 ffmpeg가 아래 경로에서 발견되었습니다.
+
+```text
+C:\Users\bangj\Downloads\ffmpeg-2026-05-18-git-b4d11dffbf-essentials_build\bin\ffmpeg.exe
+```
+
+다른 PC에서 사용하려면 ffmpeg의 `bin` 폴더를 Windows `PATH`에 추가하세요.
+현재 PC에는 Node.js가 설치되어 있어 앱이 `yt-dlp --js-runtimes node --remote-components ejs:github` 옵션을 자동으로 사용합니다.
+
+## 기능
+
+- 단일 영상 URL 다운로드
+- 재생목록 URL 다운로드
+- 영상 MP4 다운로드
+- 음원 MP3 추출
+- 저장 폴더 선택 및 마지막 선택 기억
+- 진행률, 로그, 취소 버튼
+- Python, yt-dlp, ffmpeg 상태 표시
+
+## 설정 저장 위치
+
+앱은 마지막 저장 폴더와 선택한 형식을 아래 파일에 저장합니다.
+
+```text
+%APPDATA%\YoutubeDownloaderGui\settings.json
+```
+
+## 다음 단계
+
+- PyInstaller로 exe 포장
+- Chrome 확장 프로그램에서 현재 YouTube URL을 앱으로 보내기
+- 재생목록별 하위 폴더 자동 생성 옵션

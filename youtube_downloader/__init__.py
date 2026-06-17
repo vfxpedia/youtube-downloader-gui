@@ -1,0 +1,1 @@
+"""Desktop YouTube playlist downloader."""
