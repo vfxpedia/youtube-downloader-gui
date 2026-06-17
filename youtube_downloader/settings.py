@@ -17,6 +17,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "last_filename_mode": "title",
     "last_folder_mode": "playlist",
     "last_duplicate_mode": "skip",
+    "last_subtitle_mode": "none",
     "window_geometry": "",
     "window_state": "",
     "splitter_state": "",

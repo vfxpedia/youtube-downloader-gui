@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import re
 import unicodedata
@@ -7,9 +8,10 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
+import subprocess
 
 from PySide6.QtCore import QByteArray, QObject, QThread, Signal, Slot
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QColor, QCloseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -81,6 +83,22 @@ DUPLICATE_MODE_LABELS = {
     "overwrite": "덮어쓰기",
     "unique": "새 이름으로 저장",
     "archive": "다운로드 기록 기준 건너뛰기",
+}
+
+SUBTITLE_MODE_LABELS = {
+    "none": "자막 받지 않음",
+    "manual": "공식 자막 SRT",
+    "auto": "자동 자막 SRT",
+    "both": "공식 + 자동 자막 SRT",
+}
+
+RESULT_FILTER_LABELS = {
+    "all": "전체",
+    "problem": "문제만",
+    "ok": "정상",
+    "incomplete": "미완료",
+    "review": "확인 필요",
+    "missing": "누락",
 }
 
 
@@ -203,6 +221,8 @@ class MainWindow(QMainWindow):
         self._continue_after_cleanup = False
         self._active_jobs: list[QueueJob] = []
         self._last_audit_results: list[AuditResult] = []
+        self._paused_jobs: list[QueueJob] = []
+        self._pause_requested = False
         self._session_log_path: Path | None = None
 
         self.url_input = QLineEdit()
@@ -254,16 +274,25 @@ class MainWindow(QMainWindow):
         self.duplicate_mode_combo.setCurrentIndex(max(selected_duplicate_mode, 0))
         self.duplicate_mode_combo.currentIndexChanged.connect(self.refresh_preview_filenames)
 
-        self.preview_button = QPushButton("목록 불러오기")
+        self.subtitle_combo = QComboBox()
+        for mode, label in SUBTITLE_MODE_LABELS.items():
+            self.subtitle_combo.addItem(label, mode)
+        selected_subtitle_mode = self.subtitle_combo.findData(self._settings.get("last_subtitle_mode", "none"))
+        self.subtitle_combo.setCurrentIndex(max(selected_subtitle_mode, 0))
+
+        self.preview_button = QPushButton("1. 목록 불러오기")
         self.preview_button.clicked.connect(self.load_preview)
-        self.add_queue_button = QPushButton("대기열 추가")
+        self.add_queue_button = QPushButton("2. 대기열 추가")
         self.add_queue_button.setEnabled(False)
         self.add_queue_button.clicked.connect(self.add_preview_to_queue)
-        self.download_button = QPushButton("대기열 다운로드 시작")
+        self.download_button = QPushButton("3. 다운로드 시작")
         self.download_button.clicked.connect(self.start_download)
-        self.cancel_button = QPushButton("취소")
+        self.cancel_button = QPushButton("일시정지")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel_download)
+        self.resume_button = QPushButton("이어받기")
+        self.resume_button.setEnabled(False)
+        self.resume_button.clicked.connect(self.resume_download)
         self.clear_queue_button = QPushButton("대기열 비우기")
         self.clear_queue_button.clicked.connect(self.clear_queue)
         self.move_up_button = QPushButton("위로")
@@ -275,6 +304,14 @@ class MainWindow(QMainWindow):
         self.retry_problem_button = QPushButton("문제 항목만 다시 받기")
         self.retry_problem_button.setEnabled(False)
         self.retry_problem_button.clicked.connect(self.retry_problem_items)
+        self.result_filter_combo = QComboBox()
+        for mode, label in RESULT_FILTER_LABELS.items():
+            self.result_filter_combo.addItem(label, mode)
+        self.result_filter_combo.currentIndexChanged.connect(self.refresh_result_filter)
+        self.open_output_button = QPushButton("저장 폴더 열기")
+        self.open_output_button.clicked.connect(self.open_output_folder)
+        self.open_report_button = QPushButton("세션 리포트 열기")
+        self.open_report_button.clicked.connect(self.open_session_report)
 
         self.dependency_label = QLabel()
         self.refresh_button = QPushButton("상태 새로고침")
@@ -295,7 +332,7 @@ class MainWindow(QMainWindow):
         self._set_column_widths(self.preview_table, [54, 320, 80, 520])
 
         self.queue_table = QTableWidget(0, 8)
-        self.queue_table.setHorizontalHeaderLabels(["제목", "항목", "형식", "화질", "저장 폴더", "파일명", "중복 처리", "URL"])
+        self.queue_table.setHorizontalHeaderLabels(["제목", "항목", "형식", "화질", "저장 폴더", "파일명", "중복/자막", "URL"])
         self._setup_table(self.queue_table)
         self._set_column_widths(self.queue_table, [240, 70, 100, 110, 240, 160, 180, 360])
 
@@ -345,6 +382,7 @@ class MainWindow(QMainWindow):
 
         self.main_splitter = QSplitter()
         left = QWidget()
+        left.setMaximumWidth(650)
         left_layout = QVBoxLayout(left)
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -369,12 +407,15 @@ class MainWindow(QMainWindow):
         input_layout.addWidget(self.folder_name_input, 4, 1, 1, 3)
         input_layout.addWidget(QLabel("중복"), 5, 0)
         input_layout.addWidget(self.duplicate_mode_combo, 5, 1, 1, 3)
+        input_layout.addWidget(QLabel("자막"), 6, 0)
+        input_layout.addWidget(self.subtitle_combo, 6, 1, 1, 3)
 
         action_layout = QHBoxLayout()
         action_layout.addWidget(self.preview_button)
         action_layout.addWidget(self.add_queue_button)
         action_layout.addWidget(self.download_button)
         action_layout.addWidget(self.cancel_button)
+        action_layout.addWidget(self.resume_button)
         action_layout.addWidget(self.clear_queue_button)
         action_layout.addStretch(1)
 
@@ -413,9 +454,16 @@ class MainWindow(QMainWindow):
         result_group = QGroupBox("결과 검증")
         result_layout = QVBoxLayout(result_group)
         result_layout.addWidget(self.result_summary_label)
+        result_filter_layout = QHBoxLayout()
+        result_filter_layout.addWidget(QLabel("보기"))
+        result_filter_layout.addWidget(self.result_filter_combo)
+        result_filter_layout.addStretch(1)
+        result_layout.addLayout(result_filter_layout)
         result_layout.addWidget(self.result_table)
         result_action_layout = QHBoxLayout()
         result_action_layout.addWidget(self.retry_problem_button)
+        result_action_layout.addWidget(self.open_output_button)
+        result_action_layout.addWidget(self.open_report_button)
         result_action_layout.addStretch(1)
         result_layout.addLayout(result_action_layout)
 
@@ -434,7 +482,9 @@ class MainWindow(QMainWindow):
 
         self.main_splitter.addWidget(left)
         self.main_splitter.addWidget(right)
-        self.main_splitter.setSizes([640, 500])
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([560, 900])
         root_layout.addWidget(self.main_splitter)
         self.setCentralWidget(central)
 
@@ -664,6 +714,7 @@ class MainWindow(QMainWindow):
                 "last_filename_mode": request.filename_mode,
                 "last_folder_mode": request.folder_mode,
                 "last_duplicate_mode": request.duplicate_mode,
+                "last_subtitle_mode": request.subtitle_mode,
             }
         )
         self._append_queue_row(job)
@@ -692,6 +743,7 @@ class MainWindow(QMainWindow):
             duplicate_mode=duplicate_mode,
             collection_title=self._current_collection_title(info),
             name_token=name_token,
+            subtitle_mode=str(self.subtitle_combo.currentData()),
         )
 
     def _current_collection_title(self, info: MediaInfo) -> str:
@@ -708,7 +760,9 @@ class MainWindow(QMainWindow):
         self.queue_table.setItem(row, 3, QTableWidgetItem(quality))
         self.queue_table.setItem(row, 4, QTableWidgetItem(self._queue_folder_text(job.request)))
         self.queue_table.setItem(row, 5, QTableWidgetItem(FILENAME_MODE_LABELS.get(job.request.filename_mode, job.request.filename_mode)))
-        self.queue_table.setItem(row, 6, QTableWidgetItem(DUPLICATE_MODE_LABELS.get(job.request.duplicate_mode, job.request.duplicate_mode)))
+        duplicate_text = DUPLICATE_MODE_LABELS.get(job.request.duplicate_mode, job.request.duplicate_mode)
+        subtitle_text = SUBTITLE_MODE_LABELS.get(job.request.subtitle_mode, job.request.subtitle_mode)
+        self.queue_table.setItem(row, 6, QTableWidgetItem(f"{duplicate_text} / {subtitle_text}"))
         self.queue_table.setItem(row, 7, QTableWidgetItem(job.request.url))
 
     def _queue_folder_text(self, request: DownloadRequest) -> str:
@@ -805,9 +859,24 @@ class MainWindow(QMainWindow):
     @Slot()
     def cancel_download(self) -> None:
         if self._download_worker is not None:
-            self.status_label.setText("취소 요청 중")
+            self._pause_requested = True
+            self._paused_jobs = list(self._active_jobs) + list(self._queue)
+            self._queue.clear()
+            self.queue_table.setRowCount(0)
+            self.status_label.setText("일시정지 요청 중")
             self._download_worker.cancel()
             self.cancel_button.setEnabled(False)
+
+    @Slot()
+    def resume_download(self) -> None:
+        if self._download_worker is not None or not self._paused_jobs:
+            return
+        self._queue = list(self._paused_jobs)
+        self._paused_jobs = []
+        self._refresh_queue_table()
+        self._append_log("일시정지된 작업을 이어받기 대기열에 복원했습니다.")
+        self.resume_button.setEnabled(False)
+        self.start_download()
 
     @Slot(float, float, str)
     def update_progress(self, overall_percent: float, current_percent: float, detail: str) -> None:
@@ -822,6 +891,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText("완료")
         self._append_log("작업이 완료되었습니다.")
         self._audit_active_jobs("완료")
+        self.right_tabs.setCurrentIndex(2)
         self._set_running(False)
         if self._queue:
             self._append_log("새로 추가된 대기열을 이어서 다운로드합니다.")
@@ -831,17 +901,24 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def download_cancelled(self) -> None:
-        self.status_label.setText("취소됨")
-        self._append_log("작업이 취소되었습니다.")
+        if self._pause_requested:
+            self.status_label.setText("일시정지됨")
+            self._append_log("작업이 일시정지되었습니다. 이어받기를 누르면 기존 파일을 이어서 받습니다.")
+        else:
+            self.status_label.setText("취소됨")
+            self._append_log("작업이 취소되었습니다.")
         self._audit_active_jobs("취소 후 검증")
+        self.right_tabs.setCurrentIndex(2)
         self._set_running(False)
-        self._notify("다운로드 취소", "다운로드가 취소되었습니다.")
+        self._notify("다운로드 일시정지", "이어받기를 누르면 중단된 작업을 다시 시작합니다.")
+        self._pause_requested = False
 
     @Slot(str)
     def download_failed(self, message: str) -> None:
         self.status_label.setText("오류")
         self._append_log(f"오류: {message}")
         self._audit_active_jobs("오류 후 검증")
+        self.right_tabs.setCurrentIndex(2)
         self._set_running(False)
         self._notify("다운로드 실패", "자세한 원인은 앱 로그와 실패 팝업을 확인하세요.")
         QMessageBox.critical(self, "다운로드 실패", message)
@@ -1003,6 +1080,20 @@ class MainWindow(QMainWindow):
             f"{label}: 총 {len(results)}개 중 정상 {ok_count}개, 미완료 {incomplete_count}개, 확인 필요 {review_count}개, 누락 {missing_count}개"
         )
         self.retry_problem_button.setEnabled(any(result.status in {"미완료", "누락", "확인 필요"} for result in results))
+        if any(result.status != "정상" for result in results):
+            problem_index = self.result_filter_combo.findData("problem")
+            if problem_index >= 0:
+                self.result_filter_combo.setCurrentIndex(problem_index)
+        else:
+            all_index = self.result_filter_combo.findData("all")
+            if all_index >= 0:
+                self.result_filter_combo.setCurrentIndex(all_index)
+        self.refresh_result_filter()
+
+    @Slot()
+    @Slot(int)
+    def refresh_result_filter(self, _index: int | None = None) -> None:
+        results = self._filtered_audit_results()
 
         self.result_table.setSortingEnabled(False)
         self.result_table.setRowCount(0)
@@ -1018,8 +1109,25 @@ class MainWindow(QMainWindow):
                 result.action,
             ]
             for column, value in enumerate(values):
-                self.result_table.setItem(row, column, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                if column == 2:
+                    item.setBackground(_status_color(result.status))
+                self.result_table.setItem(row, column, item)
         self.result_table.setSortingEnabled(True)
+
+    def _filtered_audit_results(self) -> list[AuditResult]:
+        mode = str(self.result_filter_combo.currentData())
+        if mode == "problem":
+            return [result for result in self._last_audit_results if result.status != "정상"]
+        if mode == "ok":
+            return [result for result in self._last_audit_results if result.status == "정상"]
+        if mode == "incomplete":
+            return [result for result in self._last_audit_results if result.status == "미완료"]
+        if mode == "review":
+            return [result for result in self._last_audit_results if result.status == "확인 필요"]
+        if mode == "missing":
+            return [result for result in self._last_audit_results if result.status == "누락"]
+        return list(self._last_audit_results)
 
     def _write_audit_log(self, label: str, results: list[AuditResult]) -> None:
         self._append_log(f"결과 검증: {self.result_summary_label.text()}")
@@ -1066,6 +1174,27 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "재시도 실패", "개별 영상 URL이 없어 대기열에 추가하지 못했습니다.")
 
+    @Slot()
+    def open_output_folder(self) -> None:
+        folder = self._current_output_folder()
+        if not folder.exists():
+            QMessageBox.warning(self, "폴더 없음", f"저장 폴더를 찾지 못했습니다.\n{folder}")
+            return
+        _open_path(folder)
+
+    @Slot()
+    def open_session_report(self) -> None:
+        if self._session_log_path is None or not self._session_log_path.exists():
+            QMessageBox.information(self, "리포트 없음", "아직 열 수 있는 세션 로그가 없습니다.")
+            return
+        _open_path(self._session_log_path)
+
+    def _current_output_folder(self) -> Path:
+        if self._active_jobs:
+            return self._active_jobs[0].request.output_dir
+        output_text = self.output_input.text().strip()
+        return Path(output_text) if output_text else Path(self._settings["last_output_dir"])
+
     @Slot(str)
     def _append_log(self, message: str) -> None:
         self.log_view.append(message)
@@ -1082,6 +1211,7 @@ class MainWindow(QMainWindow):
     def _set_running(self, running: bool) -> None:
         self.download_button.setEnabled(not running)
         self.cancel_button.setEnabled(running)
+        self.resume_button.setEnabled(not running and bool(self._paused_jobs))
         self.clear_queue_button.setEnabled(not running)
         self.move_up_button.setEnabled(not running)
         self.move_down_button.setEnabled(not running)
@@ -1124,6 +1254,27 @@ def _format_duration(duration: int | None) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{seconds:02d}"
     return f"{minutes}:{seconds:02d}"
+
+
+def _status_color(status: str) -> QColor:
+    if status == "정상":
+        return QColor("#dff5e1")
+    if status == "미완료":
+        return QColor("#fff0c2")
+    if status == "확인 필요":
+        return QColor("#e7f0ff")
+    if status == "누락":
+        return QColor("#ffd9d9")
+    return QColor("#f1f1f1")
+
+
+def _open_path(path: Path) -> None:
+    if sys.platform.startswith("win"):
+        os.startfile(str(path))  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
 
 
 def _safe_list_files(folder: Path) -> list[Path]:

@@ -30,6 +30,21 @@ class DownloaderCommandTests(unittest.TestCase):
         self.assertIn("--retry-sleep", command)
         self.assertIn("file_access:2", command)
 
+    def test_build_command_can_request_srt_subtitles(self) -> None:
+        request = DownloadRequest(
+            url="https://www.youtube.com/watch?v=abc123",
+            output_dir=Path("C:/Downloads"),
+            mode="video",
+            subtitle_mode="both",
+        )
+
+        command = build_command(request)
+
+        self.assertIn("--write-subs", command)
+        self.assertIn("--write-auto-subs", command)
+        self.assertIn("--convert-subs", command)
+        self.assertIn("srt", command)
+
 
 class AuditTests(unittest.TestCase):
     @classmethod
@@ -87,6 +102,41 @@ class AuditTests(unittest.TestCase):
             self.assertEqual([result.status for result in results], ["정상", "정상", "미완료"])
             self.assertTrue(results[2].actual_path)
             self.assertTrue(str(results[2].actual_path).endswith((".part", ".webm")))
+
+    def test_result_filter_shows_only_problem_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            playlist = root / "playlist"
+            playlist.mkdir()
+            (playlist / "done.mp4").write_bytes(b"ok")
+            request = DownloadRequest(
+                url="https://www.youtube.com/playlist?list=PL_TEST",
+                output_dir=root,
+                mode="video",
+                folder_mode="playlist",
+                collection_title="playlist",
+            )
+            job = QueueJob(
+                title="playlist",
+                item_count=2,
+                request=request,
+                entries=[
+                    MediaEntry(title="done", url="https://www.youtube.com/watch?v=one"),
+                    MediaEntry(title="missing", url="https://www.youtube.com/watch?v=two"),
+                ],
+            )
+
+            window = MainWindow()
+            try:
+                results = window._build_audit_results([job])
+                window._display_audit_results("테스트", results)
+                problem_index = window.result_filter_combo.findData("problem")
+                window.result_filter_combo.setCurrentIndex(problem_index)
+                window.refresh_result_filter()
+                self.assertEqual(window.result_table.rowCount(), 1)
+                self.assertEqual(window.result_table.item(0, 2).text(), "누락")
+            finally:
+                window.close()
 
 
 if __name__ == "__main__":

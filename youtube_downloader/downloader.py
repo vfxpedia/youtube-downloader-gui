@@ -54,6 +54,7 @@ class DownloadRequest:
     collection_title: str = ""
     name_token: str = ""
     index_override: int | None = None
+    subtitle_mode: str = "none"
 
 
 @dataclass(frozen=True)
@@ -178,6 +179,15 @@ def build_command(request: DownloadRequest) -> list[str]:
         command.extend(["-f", _video_format_selector(request.quality), "--merge-output-format", "mp4"])
     else:
         raise ValueError(f"Unsupported download mode: {request.mode}")
+
+    if request.subtitle_mode == "manual":
+        command.extend(["--write-subs", "--sub-langs", "ko,en.*", "--convert-subs", "srt"])
+    elif request.subtitle_mode == "auto":
+        command.extend(["--write-auto-subs", "--sub-langs", "ko,en.*", "--convert-subs", "srt"])
+    elif request.subtitle_mode == "both":
+        command.extend(["--write-subs", "--write-auto-subs", "--sub-langs", "ko,en.*", "--convert-subs", "srt"])
+    elif request.subtitle_mode != "none":
+        raise ValueError(f"Unsupported subtitle mode: {request.subtitle_mode}")
 
     command.append(request.url)
     return command
